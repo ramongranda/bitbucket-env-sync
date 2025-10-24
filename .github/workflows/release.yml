@@ -50,24 +50,22 @@ jobs:
         id: get_tag
         run: |
           python - <<'PY'
-          import tomllib, os
+          import re, os
+          from datetime import datetime
           tag = ''
           try:
-              with open('pyproject.toml', 'rb') as f:
-                  data = tomllib.load(f)
-                  if isinstance(data, dict):
-                      tag = data.get('project', {}).get('version', '')
-                      if tag:
-                          tag = 'v' + tag
+              txt = open('pyproject.toml', 'r', encoding='utf-8').read()
+              # Try to find a version = "x.y.z" line (works for [project] or tool.poetry)
+              m = re.search(r'(?m)^[ \t]*version[ \t]*=[ \t]*["\']([^"\']+)["\']', txt)
+              if m:
+                  tag = 'v' + m.group(1)
           except Exception:
               tag = ''
           if not tag:
-              from datetime import datetime
               sha = os.environ.get('GITHUB_SHA', '')
               short = sha[:7] if sha else 'local'
               tag = f"v{datetime.utcnow().strftime('%Y%m%d')}-{short}"
           print(tag)
-          # Export to GITHUB_OUTPUT for step outputs
           with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
               out.write(f"tag={tag}\n")
           PY
@@ -79,36 +77,52 @@ jobs:
       - name: Debug: check token can access repository
         uses: actions/github-script@v6
         with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const repo = context.repo;
-            const res = await github.rest.repos.get({ owner: repo.owner, repo: repo.repo });
-            core.info(`repo full_name: ${res.data.full_name}`);
-            core.info(`private: ${res.data.private}`);
+            try {
+              const res = await github.rest.repos.get({ owner: repo.owner, repo: repo.repo });
+              console.log(`repo full_name: ${res.data.full_name}`);
+              console.log(`private: ${res.data.private}`);
+            } catch (e) {
+              console.warn(`repos.get failed: ${e.message}`);
+            }
             // Try to list releases (permission check)
             try {
               const rel = await github.rest.repos.listReleases({ owner: repo.owner, repo: repo.repo, per_page: 1 });
-              core.info(`releases_count_sample: ${rel.data.length}`);
+              console.log(`releases_count_sample: ${rel.data.length}`);
             } catch (e) {
-              core.warning(`listReleases failed: ${e.message}`);
-              throw e;
+              console.warn(`listReleases failed: ${e.message}`);
             }
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
 
-      - name: Create GitHub release
+      - name: Create GitHub release (via github-script)
         id: create_release
-        uses: actions/create-release@v1
+        uses: actions/github-script@v6
         with:
-          tag_name: ${{ steps.get_tag.outputs.tag }}
-          release_name: "Release ${{ steps.get_tag.outputs.tag }}"
-          body: "Automated release created from master push ${{ github.sha }}"
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const repo = context.repo;
+            const tag = process.env.RELEASE_TAG || '${{ steps.get_tag.outputs.tag }}';
+            console.log(`Creating release for tag ${tag}`);
+            const res = await github.rest.repos.createRelease({
+              owner: repo.owner,
+              repo: repo.repo,
+              tag_name: tag,
+              name: `Release ${tag}`,
+              body: `Automated release created from master push ${process.env.GITHUB_SHA || ''}`,
+              draft: false,
+              prerelease: false,
+            });
+            console.log(`release created: ${res.data.html_url}`);
+            return res.data.upload_url;
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_SHA: ${{ github.sha }}
 
       - name: Upload release asset
         uses: actions/upload-release-asset@v1
         with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          upload_url: ${{ steps.create_release.outputs.result }}
           asset_path: release_assets.zip
           asset_name: release_assets.zip
           asset_content_type: application/zip
