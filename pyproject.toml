@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bb-sync"
+version = "0.1.0"
+description = "Bitbucket workspace/project sync (clone/pull) with .env inventory"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = ["requests>=2.28"]
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+
+[tool.isort]
+profile = "black"
+line_length = 100
+combine_as_imports = true
+known_first_party = ["bb_sync"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]

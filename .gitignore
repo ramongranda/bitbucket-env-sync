@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# Env / local
+.env
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
