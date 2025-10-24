@@ -212,6 +212,14 @@ flake8
 | `make build-all`   | Build both                   |
 | `make zip`         | Create deployable zip bundle |
 
+## 🚀 Download
+
+Get the latest binaries:
+
+- [Windows](https://github.com/ramongranda/bb-sync/releases/latest/download/bb_sync_Windows.zip)
+- [Linux](https://github.com/ramongranda/bb-sync/releases/latest/download/bb_sync_Linux.zip)
+- [All platforms (ZIP)](https://github.com/ramongranda/bb-sync/releases/latest/download/release_assets.zip)
+
 ## License
 
 This project is licensed under the MIT License. See the `LICENSE` file for the
