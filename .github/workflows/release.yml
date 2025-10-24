@@ -76,6 +76,25 @@ jobs:
           cd dist_all
           zip -r ../release_assets.zip . || true
 
+      - name: Debug: check token can access repository
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const repo = context.repo;
+            const res = await github.rest.repos.get({ owner: repo.owner, repo: repo.repo });
+            core.info(`repo full_name: ${res.data.full_name}`);
+            core.info(`private: ${res.data.private}`);
+            // Try to list releases (permission check)
+            try {
+              const rel = await github.rest.repos.listReleases({ owner: repo.owner, repo: repo.repo, per_page: 1 });
+              core.info(`releases_count_sample: ${rel.data.length}`);
+            } catch (e) {
+              core.warning(`listReleases failed: ${e.message}`);
+              throw e;
+            }
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Create GitHub release
         id: create_release
         uses: actions/create-release@v1
