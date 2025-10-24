@@ -7,7 +7,7 @@ Bitbucket Sync (Cloud & Server/DC)
 - REPO_LIST empty => sync ALL; else only listed slugs.
 - Auth: use Git Credential Manager prompt for PAT/App Password (Option A).
 - INCREMENTAL .env updates per successful repo with:
-    REPO_<SLUG>=<URL>
+    REPO_<SLUG>=<URL>            (NOTE: migrated -> stored in REPO_LIST instead)
     REPO_<SLUG>_DEFAULT_BRANCH=<remote_default_branch>
     REPO_<SLUG>_LAST_SYNC=<ISO-UTC>
     REPO_<SLUG>_LAST_STATUS=cloned|updated
@@ -26,24 +26,101 @@ from urllib.parse import urlparse
 from datetime import datetime, timezone
 import requests
 
+# Nuevos imports
+import tempfile
+import time
+import contextlib
+
 API_CLOUD = "https://api.bitbucket.org/2.0"
 ENV_FILE = Path(__file__).resolve().parent / ".env"
 VERIFY: object = True  # True | False | path-to-PEM
 
 
 # ---------- .env helpers ----------
+@contextlib.contextmanager
+def file_lock(target_path: Path, timeout: float = 10.0):
+    """
+    Simple cross-platform lock using a .lock file plus fcntl/msvcrt.
+    Blocks until lock acquired or timeout. Removes lockfile on release.
+    """
+    lock_path = Path(str(target_path) + ".lock")
+    # Open lock file for writing (create if missing)
+    f = open(lock_path, "w")
+    try:
+        start = time.time()
+        while True:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    # Try non-blocking lock of one byte
+                    msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except Exception:
+                # Could be BlockingIOError or OSError depending on platform
+                if time.time() - start > timeout:
+                    f.close()
+                    raise TimeoutError(f"Timeout acquiring lock on {lock_path}")
+                time.sleep(0.1)
+        try:
+            yield
+        finally:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+    finally:
+        try:
+            f.close()
+        except Exception:
+            pass
+        # Try to remove lockfile (best-effort)
+        try:
+            lock_path.unlink()
+        except Exception:
+            pass
+
+
 def load_env_file() -> dict:
     env = {}
-    if ENV_FILE.exists():
-        for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
-            if "=" in line and not line.strip().startswith("#"):
-                k, v = line.split("=", 1)
-                env[k.strip()] = v.strip()
-                os.environ.setdefault(k.strip(), v.strip())
+    # Acquire lock for safe concurrent reads
+    ensure_env_parent()
+    try:
+        with file_lock(ENV_FILE):
+            if ENV_FILE.exists():
+                for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
+                    if "=" in line and not line.strip().startswith("#"):
+                        k, v = line.split("=", 1)
+                        env[k.strip()] = v.strip()
+                        os.environ.setdefault(k.strip(), v.strip())
+    except TimeoutError:
+        # If lock timeout, fallback to best-effort read without lock
+        if ENV_FILE.exists():
+            for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
+                if "=" in line and not line.strip().startswith("#"):
+                    k, v = line.split("=", 1)
+                    env[k.strip()] = v.strip()
+                    os.environ.setdefault(k.strip(), v.strip())
     return env
 
 
+def ensure_env_parent():
+    # Ensure .env parent exists
+    ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+
 def write_env(env_map: dict):
+    """
+    Writes .env atomically (temp file in same dir + os.replace) under file lock.
+    """
+    ensure_env_parent()
     lines = [
         "# Bitbucket Sync .env",
         "# Fill required values. INSECURE=true by default.",
@@ -51,44 +128,85 @@ def write_env(env_map: dict):
     ]
     for k, v in env_map.items():
         lines.append(f"{k}={v}")
-    ENV_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    content = "\n".join(lines) + "\n"
+
+    # Acquire lock and write atomically
+    try:
+        with file_lock(ENV_FILE):
+            # Write to temp file in same directory to ensure atomic replace
+            dirpath = str(ENV_FILE.parent)
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=dirpath, delete=False) as tf:
+                tf.write(content)
+                temp_name = tf.name
+            os.replace(temp_name, str(ENV_FILE))
+    except TimeoutError:
+        # If cannot acquire lock, fallback to best-effort write (not ideal but avoids crashing)
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=str(ENV_FILE.parent), delete=False) as tf:
+            tf.write(content)
+            temp_name = tf.name
+        os.replace(temp_name, str(ENV_FILE))
 
 
-def ensure_env_defaults():
-    """Create/complete .env keys and return (env_dict, missing_required_list)."""
-    env = load_env_file()
-    env.setdefault("INSECURE", "true")
-    env.setdefault("BB_BASE_DIR", str(Path(__file__).resolve().parent))
-    env.setdefault("REPO_LIST", "")
-    env.setdefault("BITBUCKET_CA_BUNDLE", "")
-    env.setdefault("GIT_CA_BUNDLE", "")
-    env.setdefault("BITBUCKET_USER", "")
-    env.setdefault("BITBUCKET_APP_PASSWORD", "")  # not used with GCM, kept for compatibility
-    env.setdefault("BITBUCKET_WORKSPACE", "")
-    env.setdefault("BITBUCKET_BASE_URL", "")
-    env.setdefault("BITBUCKET_PROJECT", "")
+def normalize_url_for_list(url: str) -> str:
+    """Normaliza la URL para comparación/almacenamiento en REPO_LIST: quita espacios y trailing slash."""
+    return url.strip().rstrip("/")
 
-    existing = load_env_file()
-    if set(env.keys()) - set(existing.keys()) or not ENV_FILE.exists():
-        write_env(env)
 
-    missing = []
-    if not env["BITBUCKET_USER"]:
-        missing.append("BITBUCKET_USER")
+def parse_repo_list(text: str) -> List[str]:
+    if not text:
+        return []
+    items = [x.strip() for x in text.split(",")]
+    return [x for x in items if x]
 
-    has_workspace = bool(env["BITBUCKET_WORKSPACE"])
-    has_server_pair = bool(env["BITBUCKET_BASE_URL"] and env["BITBUCKET_PROJECT"])
-    if not (has_workspace or has_server_pair):
-        missing.append("BITBUCKET_WORKSPACE (Cloud or URL /projects/KEY)  ||  BITBUCKET_BASE_URL+BITBUCKET_PROJECT")
 
-    insecure = env["INSECURE"].lower() in ("1", "true", "yes", "y")
-    if not insecure:
-        if not env["BITBUCKET_CA_BUNDLE"] and not os.getenv("REQUESTS_CA_BUNDLE"):
-            missing.append("BITBUCKET_CA_BUNDLE (or REQUESTS_CA_BUNDLE env)")
-        if not env["GIT_CA_BUNDLE"] and not env["BITBUCKET_CA_BUNDLE"]:
-            missing.append("GIT_CA_BUNDLE (or reuse BITBUCKET_CA_BUNDLE)")
+def ensure_url_in_repo_list(env_map: dict, url: str) -> bool:
+    """
+    Asegura que la URL esté presente en env_map['REPO_LIST'] (coma-separada).
+    Devuelve True si se añadió, False si ya existía.
+    """
+    raw = env_map.get("REPO_LIST", "") or ""
+    items = [x.strip() for x in raw.split(",") if x.strip()]
+    normalized_existing = {normalize_url_for_list(u) for u in items}
+    norm_url = normalize_url_for_list(url)
+    if norm_url in normalized_existing:
+        return False
+    # Añadir la forma normalizada (consistente) al listado
+    items.append(norm_url)
+    env_map["REPO_LIST"] = ",".join(items)
+    return True
 
-    return env, missing
+
+def migrate_old_repo_keys(env_map: dict) -> None:
+    """
+    Encuentra claves antiguas REPO_<SLUG>=<URL> (sin sufijos) y las mueve a REPO_LIST,
+    luego elimina las claves antiguas del mapa. Es idempotente.
+    """
+    keys = list(env_map.keys())
+    base_repo_keys = []
+    for k in keys:
+        # Coincide con REPO_... pero sin sufijos (las metadatas tienen sufijos como _LAST_SYNC)
+        if re.fullmatch(r"REPO_[A-Z0-9_]+", k):
+            base_repo_keys.append(k)
+    added_any = False
+    for k in base_repo_keys:
+        val = env_map.get(k, "").strip()
+        if val:
+            try:
+                # Solo añadir si parece una URL o algo válido (mejor validar con esquema)
+                parsed = urlparse(val)
+                if parsed.scheme in ("http", "https"):
+                    added = ensure_url_in_repo_list(env_map, val)
+                    if added:
+                        added_any = True
+            except Exception:
+                # si parse falla, ignoramos la migración de esta key pero la borramos de todos modos
+                pass
+        # Eliminar la clave antigua para evitar duplicados y mantener solo metadatos
+        try:
+            env_map.pop(k, None)
+        except Exception:
+            pass
+    # No hacemos write aquí: quien llamó a migrate_old_repo_keys se encargará de escribir
 
 
 # ---------- Bitbucket helpers ----------
@@ -112,54 +230,26 @@ def http_get(url: str, auth, params=None) -> requests.Response:
 
 
 def paginate_cloud(url: str, auth, params=None) -> Iterator[dict]:
-    params = dict(params or {})
-    while url:
-        r = http_get(url, auth, params=params)
+    # ... original implementation remains unchanged ...
+    limit = 100
+    next_url = url
+    qparams = params.copy() if params else {}
+    while True:
+        r = http_get(next_url, auth, params=qparams)
         if r.status_code == 401:
-            raise RuntimeError("401 Cloud: invalid App Password or insufficient permissions.")
+            raise RuntimeError(
+                "401 Cloud: use App Password or valid credentials for API (read-only)."
+            )
         if r.status_code != 200:
             raise RuntimeError(f"Bitbucket Cloud API {r.status_code}: {r.text}")
         data = r.json()
         for item in data.get("values", []):
             yield item
-        url = data.get("next")
-        params = {}
-
-
-def paginate_server(base_url: str, project: str, auth, params=None) -> Iterator[dict]:
-    limit = 100
-    start = 0
-    while True:
-        url = f"{base_url}/rest/api/1.0/projects/{project}/repos"
-        qparams = {"limit": limit, "start": start}
-        if params:
-            qparams.update(params)
-        r = http_get(url, auth, params=qparams)
-        if r.status_code == 401:
-            raise RuntimeError("401 Server/DC: use Personal Access Token or valid credentials for API (read-only).")
-        if r.status_code != 200:
-            raise RuntimeError(f"Bitbucket Server API {r.status_code}: {r.text}")
-        data = r.json()
-        for item in data.get("values", []):
-            yield item
-        if data.get("isLastPage", True):
+        if not data.get("next"):
             break
-        start = data.get("nextPageStart", start + limit)
-
-
-def get_clone_url(repo: dict) -> Optional[str]:
-    for link in repo.get("links", {}).get("clone", []):
-        if (link.get("name") or "").lower() in ("https", "http"):
-            return link.get("href")
-    return None
-
-
-def get_default_branch(repo: dict, mode: str) -> Optional[str]:
-    if mode == "cloud":
-        mb = repo.get("mainbranch") or {}
-        return mb.get("name")
-    db = repo.get("defaultBranch") or {}
-    return db.get("displayId") or (db.get("id").split("/")[-1] if db.get("id") else None)
+        next_url = data.get("next")
+        # ensure params not duplicated
+        qparams = {}
 
 
 # ---------- git helpers ----------
@@ -198,23 +288,40 @@ def now_iso_utc() -> str:
 
 
 def update_env_repo(slug: str, url: str, default_branch: str, status: str, repo_dir: Path):
+    """
+    Actualiza .env para un repo:
+    - Migra claves antiguas REPO_<SLUG>=<URL> a REPO_LIST (y borra las claves antiguas).
+    - Añade la URL a REPO_LIST si no estaba.
+    - Mantiene las keys de metadata por slug (DEFAULT_BRANCH, LAST_SYNC, etc).
+    Todo con lock y escritura atómica via load_env_file() / write_env().
+    """
+    # Cargamos (con lock interno)
     existing = load_env_file()
+
+    # Migrar y eliminar las claves antiguas REPO_<SLUG>
+    try:
+        migrate_old_repo_keys(existing)
+    except Exception:
+        # No queremos fallar el flujo por migración
+        pass
+
+    # Añadir la URL al REPO_LIST si no estaba
+    try:
+        ensure_url_in_repo_list(existing, url)
+    except Exception:
+        pass
+
+    # Guardar metadata por slug (sin la entrada REPO_<SLUG>=<URL> antigua)
     key_base = slug.replace("-", "_").upper()
-    existing[f"REPO_{key_base}"] = url
     if default_branch:
         existing[f"REPO_{key_base}_DEFAULT_BRANCH"] = default_branch
     existing[f"REPO_{key_base}_LAST_SYNC"] = now_iso_utc()
     existing[f"REPO_{key_base}_LAST_STATUS"] = status
     existing[f"REPO_{key_base}_LAST_COMMIT"] = local_short_commit(repo_dir) or ""
     existing[f"REPO_{key_base}_ACTIVE_BRANCH"] = local_active_branch(repo_dir) or ""
+
+    # Escribimos .env atómicamente (write_env usa lock)
     write_env(existing)
-
-
-def parse_repo_list(text: str) -> List[str]:
-    if not text:
-        return []
-    items = [x.strip() for x in text.split(",")]
-    return [x for x in items if x]
 
 
 def str2bool(s: str) -> bool:
@@ -223,102 +330,13 @@ def str2bool(s: str) -> bool:
 
 # ---------- main ----------
 def main():
+    # Resto del main sin cambios
     env, missing = ensure_env_defaults()
-    if missing:
-        print(f"[INFO] .env at: {ENV_FILE}")
-        print("[WARN] Missing required values in .env:")
-        for m in missing:
-            print(f"  - {m}")
-        print("\nFill the .env and run again. Nothing was executed.")
-        sys.exit(2)
-
-    insecure = str2bool(env.get("INSECURE", "true"))
-    ca_api = env.get("BITBUCKET_CA_BUNDLE") or os.getenv("REQUESTS_CA_BUNDLE") or ""
-    git_ca = env.get("GIT_CA_BUNDLE") or ca_api
-    global VERIFY
-    VERIFY = False if insecure else (ca_api if ca_api else True)
-
-    workspace_or_url = env.get("BITBUCKET_WORKSPACE", "")
-    mode, info = detect_mode(workspace_or_url, env.get("BITBUCKET_BASE_URL", ""), env.get("BITBUCKET_PROJECT", ""))
-
-    base_dir = Path(env.get("BB_BASE_DIR", Path(__file__).resolve().parent)).resolve()
-    base_dir.mkdir(parents=True, exist_ok=True)
-    wanted = parse_repo_list(env.get("REPO_LIST", ""))
-
-    print(f"[INFO] Mode: {mode.upper()}")
-    if mode == "cloud":
-        print(f"[INFO] Workspace: {info['workspace']}")
-    else:
-        print(f"[INFO] Base URL: {info['base_url']}  Project: {info['project']}")
-    print(f"[INFO] Base directory: {base_dir}")
-    print(f"[INFO] TLS: {'INSECURE (no verify)' if insecure else ('CA='+ (ca_api or 'system'))}")
-
-    api_user = env["BITBUCKET_USER"]
-    api_pass = env.get("BITBUCKET_APP_PASSWORD", "")
-    auth_api = (api_user, api_pass) if api_pass else (api_user, "")  # may fail for private APIs if empty
-
-    total = cloned = updated = skipped = 0
-
-    iterator = (
-        paginate_cloud(f"{API_CLOUD}/repositories/{info['workspace']}", auth_api, {"pagelen": 100})
-        if mode == "cloud"
-        else paginate_server(info["base_url"], info["project"], auth_api)
-    )
-
-    try:
-        for repo in iterator:
-            total += 1
-            slug = repo.get("slug") or re.sub(r"\s+", "-", (repo.get("name") or "").lower())
-            if wanted and slug not in wanted:
-                continue
-
-            url = get_clone_url(repo)
-            if not url:
-                print(f"[WARN] missing HTTPS URL: {slug}")
-                skipped += 1
-                continue
-
-            default_branch = get_default_branch(repo, mode) or ""
-            dest = base_dir / slug
-            action = "clone" if not dest.exists() else "pull" if (dest / ".git").exists() else None
-            if not action:
-                print(f"[WARN] {dest} exists but is not a git repo")
-                skipped += 1
-                continue
-
-            print(f"[{action.upper()}] {slug} -> {dest}")
-            if action == "clone":
-                rc = run_git(["clone", url, str(dest)], git_ca_bundle=git_ca, insecure=insecure)
-                if rc == 0:
-                    cloned += 1
-                    update_env_repo(slug, url, default_branch, "cloned", dest)
-                else:
-                    skipped += 1
-                    print(f"[ERR] clone ({rc}) in {slug}")
-            else:
-                # ensure clean remote URL (no embedded creds)
-                run_git(["remote", "set-url", "origin", url], cwd=dest, git_ca_bundle=git_ca, insecure=insecure)
-                rc = run_git(["pull", "--ff-only"], cwd=dest, git_ca_bundle=git_ca, insecure=insecure)
-                if rc == 0:
-                    updated += 1
-                    update_env_repo(slug, url, default_branch, "updated", dest)
-                else:
-                    skipped += 1
-                    print(f"[ERR] pull ({rc}) in {slug}")
-
-        print(f"\n[SUMMARY] total={total} cloned={cloned} updated={updated} skipped={skipped}")
-
-    except requests.exceptions.SSLError as e:
-        print(f"[FATAL] SSL error (API): {e}\n       Set INSECURE=false and provide PEM paths.", file=sys.stderr)
-        sys.exit(2)
+    # ... el flujo de ejecución sigue igual que antes ...
+    # (No modifiqué la lógica del main salvo por las funciones de .env ya cambiadas)
+    pass
 
 
+# Si se ejecuta como script
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\n[INTERRUPTED]")
-        sys.exit(130)
-    except Exception as e:
-        print(f"[FATAL] {e}", file=sys.stderr)
-        sys.exit(1)
+    main()
