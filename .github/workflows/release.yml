@@ -139,10 +139,12 @@ jobs:
           if [ -z "$UPLOAD_URL" ]; then
             echo "No upload URL from release step"; exit 1
           fi
+          # Strip the URI template part {?:...} that GitHub returns (e.g. '{?name,label}').
+          BASE_URL="${UPLOAD_URL%%\{*}"
           for f in dist_all/*; do
             [ -f "$f" ] || continue
             name=$(basename "$f")
             echo "Uploading $name to release"
-            curl --fail -X POST -H "Authorization: token $TOKEN" -H "Content-Type: application/octet-stream" --data-binary @"$f" "$UPLOAD_URL?name=$name"
+            curl --fail -X POST -H "Authorization: token $TOKEN" -H "Content-Type: application/octet-stream" --data-binary @"$f" "${BASE_URL}?name=${name}"
           done
 
