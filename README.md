@@ -215,9 +215,9 @@ flake8
 
 Get the latest binaries:
 
-* [Windows](https://github.com/ramongranda/bb-sync/releases/latest/download/bb_sync_Windows.zip)
-* [Linux](https://github.com/ramongranda/bb-sync/releases/latest/download/bb_sync_Linux.zip)
-* [All platforms (ZIP)](https://github.com/ramongranda/bb-sync/releases/latest/download/release_assets.zip)
+* [Windows](https://github.com/ramongranda/bitbucket-env-sync/releases/latest/download/bb_sync_Windows.exe)
+* [Linux](https://github.com/ramongranda/bitbucket-env-sync/releases/latest/download/bb_sync_Linux)
+* [All platforms (ZIP)](https://github.com/ramongranda/bitbucket-env-sync/releases/latest/download/release_assets.zip)
 
 ## License
 

@@ -2,7 +2,7 @@ name: Release
 
 on:
   push:
-    tags: ['v*']         # dispara solo en tags vX.Y.Z
+    tags: ['v*']
   workflow_dispatch: {}
 
 permissions:
@@ -29,67 +29,110 @@ jobs:
           pip install pyinstaller
 
       - name: Build
-        shell: bash
         run: |
-          pyinstaller --onefile --name bb_sync_${{ runner.os }} bb_sync.py
-          echo "Built:"
-          ls -la dist || dir dist
+          pyinstaller --onefile --name bb_sync bb_sync.py
+          echo "Built:";
+          ls -la dist || true
+
+      - name: Rename binary to stable name
+        run: |
+          set -e
+          echo "Runner OS = $RUNNER_OS"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            # On Windows runner, PyInstaller produces dist/bb_sync.exe
+            mv dist/bb_sync.exe dist/bb_sync_Windows.exe || true
+            ls -l dist || true
+          else
+            # On Linux runner, PyInstaller produces dist/bb_sync
+            mv dist/bb_sync dist/bb_sync_Linux || true
+            ls -l dist || true
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: bb_sync_${{ runner.os }}
+          name: bb_sync_${{ matrix.os }}
           path: dist/*
 
   release:
-    name: Create GitHub Release
+    name: Create GitHub Release and upload assets
     runs-on: ubuntu-latest
     needs: build
     steps:
       - uses: actions/checkout@v4
 
-      - name: Determine tag
-        id: tag
+      - name: Determine release tag
+        id: get_tag
         run: |
-          # Si viene por tag, úsalo; si no, intenta leer de pyproject.toml
-          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
-            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
-          else
-            python - <<'PY'
-          import re, sys, pathlib
-          tag = None
-          p = pathlib.Path('pyproject.toml')
-          if p.exists():
-              m = re.search(r'(?m)^\s*version\s*=\s*["\']([^"\']+)["\']', p.read_text(encoding='utf-8'))
-              if m: tag = 'v'+m.group(1)
-          print(f"tag={tag or 'v0.0.0-dev'}")
-          open(os.environ['GITHUB_OUTPUT'],'a').write(f"tag={tag or 'v0.0.0-dev'}\n")
+          python - <<'PY'
+          import os, re
+          from datetime import datetime
+          ref = os.environ.get('GITHUB_REF','')
+          tag = ''
+          if ref.startswith('refs/tags/'):
+              tag = ref.split('/')[-1]
+          else:
+              try:
+                  txt = open('pyproject.toml','r',encoding='utf-8').read()
+                  m = re.search(r'(?m)^\s*version\s*=\s*["\']([^"\']+)["\']', txt)
+                  if m:
+                      tag = 'v'+m.group(1)
+              except Exception:
+                  pass
+          if not tag:
+              sha = os.environ.get('GITHUB_SHA','')
+              short = sha[:7] if sha else 'local'
+              tag = f"v{datetime.utcnow().strftime('%Y%m%d')}-{short}"
+          print(tag)
+          with open(os.environ['GITHUB_OUTPUT'],'a') as out:
+              out.write(f"tag={tag}\n")
           PY
-          fi
 
-      - name: Download all artifacts
+      - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           path: dist_all
           merge-multiple: true
 
-      - name: Zip artifacts
+      - name: List artifacts
         run: |
-          cd dist_all
-          zip -r ../release_assets.zip . 
-          cd ..
-          ls -la
+          echo "Contents of dist_all:"; ls -la dist_all || true
 
-      - name: Install GitHub CLI
-        uses: cli/cli@v2
+      - name: Create or get release (github-script)
+        id: create_release
+        uses: actions/github-script@v6
         with:
-          version: latest
-
-      - name: Create release
+          github-token: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
+          script: |
+            const tag = process.env.TAG || '${{ steps.get_tag.outputs.tag }}'
+            const repo = context.repo
+            try {
+              let rel
+              try {
+                rel = await github.rest.repos.getReleaseByTag({ owner: repo.owner, repo: repo.repo, tag })
+              } catch (e) {
+                rel = await github.rest.repos.createRelease({ owner: repo.owner, repo: repo.repo, tag_name: tag, name: `Release ${tag}`, body: `Automated release for ${tag}` })
+              }
+              return rel.data.upload_url
+            } catch (e) {
+              core.setFailed(e.message)
+            }
         env:
-          GITHUB_TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.get_tag.outputs.tag }}
+
+      - name: Upload all artifacts to release
+        env:
+          UPLOAD_URL: ${{ steps.create_release.outputs.result }}
+          TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
         run: |
-          TAG="${{ steps.tag.outputs.tag }}"
-          # crea o actualiza
-          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" -t "Release $TAG" -n "Automated release for $TAG"
-          gh release upload "$TAG" release_assets.zip --clobber
+          set -e
+          if [ -z "$UPLOAD_URL" ]; then
+            echo "No upload URL from release step"; exit 1
+          fi
+          for f in dist_all/*; do
+            [ -f "$f" ] || continue
+            name=$(basename "$f")
+            echo "Uploading $name to release"
+            curl --fail -X POST -H "Authorization: token $TOKEN" -H "Content-Type: application/octet-stream" --data-binary @"$f" "$UPLOAD_URL?name=$name"
+          done
+
