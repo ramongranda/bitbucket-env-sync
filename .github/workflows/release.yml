@@ -2,8 +2,7 @@ name: Release
 
 on:
   push:
-    branches: [master]
-    tags: ['v*']
+    tags: ['v*']         # dispara solo en tags vX.Y.Z
   workflow_dispatch: {}
 
 permissions:
@@ -19,102 +18,78 @@ jobs:
         python-version: ['3.10']
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+
       - name: Install build deps
         run: |
           python -m pip install --upgrade pip
           pip install pyinstaller
+
       - name: Build
+        shell: bash
         run: |
-          pyinstaller --onefile --name bb_sync_${{ matrix.os }} bb_sync.py
+          pyinstaller --onefile --name bb_sync_${{ runner.os }} bb_sync.py
+          echo "Built:"
+          ls -la dist || dir dist
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: bb_sync_${{ matrix.os }}
+          name: bb_sync_${{ runner.os }}
           path: dist/*
 
-      - name: Create release (using RELEASE_PAT)
-        id: create_release_pat
-        if: ${{ secrets.RELEASE_PAT != '' }}
-        uses: actions/create-release@v1
-        with:
-          token: ${{ secrets.RELEASE_PAT }}
-          tag_name: ${{ steps.get_tag.outputs.tag }}
-          release_name: Release ${{ steps.get_tag.outputs.tag }}
-          body: Automated release created from master push ${{ github.sha }}
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
 
-      - name: Create release (using GITHUB_TOKEN)
-        id: create_release_github
-        if: ${{ secrets.RELEASE_PAT == '' }}
-        uses: actions/create-release@v1
+      - name: Determine tag
+        id: tag
+        run: |
+          # Si viene por tag, úsalo; si no, intenta leer de pyproject.toml
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            python - <<'PY'
+          import re, sys, pathlib
+          tag = None
+          p = pathlib.Path('pyproject.toml')
+          if p.exists():
+              m = re.search(r'(?m)^\s*version\s*=\s*["\']([^"\']+)["\']', p.read_text(encoding='utf-8'))
+              if m: tag = 'v'+m.group(1)
+          print(f"tag={tag or 'v0.0.0-dev'}")
+          open(os.environ['GITHUB_OUTPUT'],'a').write(f"tag={tag or 'v0.0.0-dev'}\n")
+          PY
+          fi
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          tag_name: ${{ steps.get_tag.outputs.tag }}
-          release_name: Release ${{ steps.get_tag.outputs.tag }}
-          body: Automated release created from master push ${{ github.sha }}
           path: dist_all
+          merge-multiple: true
 
       - name: Zip artifacts
         run: |
           cd dist_all
-          zip -r ../release_assets.zip . || true
+          zip -r ../release_assets.zip . 
+          cd ..
+          ls -la
 
-      - name: Ensure release token available
-      - name: Upload release asset
-        uses: actions/upload-release-asset@v1
+      - name: Install GitHub CLI
+        uses: cli/cli@v2
         with:
-          upload_url: ${{ steps.create_release_pat.outputs.upload_url || steps.create_release_github.outputs.upload_url }}
-          asset_path: release_assets.zip
-          asset_name: release_assets.zip
-          asset_content_type: application/zip
-        run: |
-          echo "Checking for RELEASE_PAT or GITHUB_TOKEN..."
-          if [ -z "${{ secrets.RELEASE_PAT }}" ] && [ -z "${{ secrets.GITHUB_TOKEN }}" ]; then
-            echo "--- ERROR: No release token available ---"
-            echo "Set a repository secret named RELEASE_PAT (a personal access token with 'repo' scope)"
-            echo "or enable GITHUB_TOKEN permissions for this workflow."
-            exit 1
-          fi
-
-      - name: Determine release tag
-        id: get_tag
-        run: |
-          python - <<'PY'
-          import re, os
-          from datetime import datetime
-          tag = ''
-          try:
-              txt = open('pyproject.toml', 'r', encoding='utf-8').read()
-              m = re.search(r'(?m)^[ \t]*version[ \t]*=[ \t]*["\']([^"\']+)["\']', txt)
-              if m:
-                  tag = 'v' + m.group(1)
-          except Exception:
-              tag = ''
-          if not tag:
-              sha = os.environ.get('GITHUB_SHA', '')
-              short = sha[:7] if sha else 'local'
-              tag = f"v{datetime.utcnow().strftime('%Y%m%d')}-{short}"
-          print(tag)
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
-              out.write(f"tag={tag}\n")
-          PY
+          version: latest
 
       - name: Create release
-        id: create_release
-        uses: actions/create-release@v1
-        with:
-          # Use RELEASE_PAT secret as fallback if GITHUB_TOKEN lacks permissions
-          token: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
-          tag_name: ${{ steps.get_tag.outputs.tag }}
-          release_name: Release ${{ steps.get_tag.outputs.tag }}
-          body: Automated release created from master push ${{ github.sha }}
-
-      - name: Upload release asset
-        uses: actions/upload-release-asset@v1
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: release_assets.zip
-          asset_name: release_assets.zip
-          asset_content_type: application/zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          # crea o actualiza
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" -t "Release $TAG" -n "Automated release for $TAG"
+          gh release upload "$TAG" release_assets.zip --clobber
