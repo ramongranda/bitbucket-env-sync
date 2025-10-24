@@ -77,7 +77,8 @@ jobs:
         id: create_release
         uses: actions/create-release@v1
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          # Use RELEASE_PAT secret as fallback if GITHUB_TOKEN lacks permissions
+          token: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
           tag_name: ${{ steps.get_tag.outputs.tag }}
           release_name: Release ${{ steps.get_tag.outputs.tag }}
           body: Automated release created from master push ${{ github.sha }}
