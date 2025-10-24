@@ -10,142 +10,167 @@ It maintains a `.env` file with configuration and **incremental sync metadata** 
 
 ---
 
-## ✨ Features
 
-* Supports **Bitbucket Cloud** and **Bitbucket Server / Data Center**.
-* Auth via **Git Credential Manager** (App Password / PAT prompt on first use).
+# Bitbucket Workspace Sync Tool
+
+[![Build](https://github.com/ramongranda/bitbucket-env-sync/actions/workflows/build.yml/badge.svg)](https://github.com/ramongranda/bitbucket-env-sync/actions/workflows/build.yml)
+[![Release](https://github.com/ramongranda/bitbucket-env-sync/actions/workflows/release.yml/badge.svg)](https://github.com/ramongranda/bitbucket-env-sync/actions/workflows/release.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+A simple cross-platform CLI to clone and update repositories from a Bitbucket
+workspace (Cloud) or project (Server/Data Center). It stores configuration and
+incremental sync metadata in a single `.env` file and is designed for simple,
+incremental repository synchronization.
+
+## Features
+
+* Supports Bitbucket Cloud and Bitbucket Server / Data Center.
+* Auth via Git Credential Manager (App Password / PAT prompt on first use).
 * Creates or updates `.env` automatically; exits if required values are missing.
 * `INSECURE=true` by default (skips TLS verification) for frictionless setup.
 * Supports corporate CA PEMs when `INSECURE=false`.
-* Incrementally updates `.env` after each successful repo:
+* Incremental metadata written to `.env` per-repo: DEFAULT_BRANCH, LAST_SYNC,
+  LAST_STATUS, LAST_COMMIT, ACTIVE_BRANCH.
 
-  * `REPO_<SLUG>=<URL>`
-  * `REPO_<SLUG>_DEFAULT_BRANCH`
-  * `REPO_<SLUG>_LAST_SYNC` (UTC)
-  * `REPO_<SLUG>_LAST_STATUS` (`cloned|updated`)
-  * `REPO_<SLUG>_LAST_COMMIT`
-  * `REPO_<SLUG>_ACTIVE_BRANCH`
+## REPO_LIST format
 
----
+Repository URLs are stored in `REPO_LIST` as one URL per line (not comma-separated).
+Example:
 
-## 🚀 Requirements
+```env
+REPO_LIST=https://bitbucket.org/workspace/repo1
+https://bitbucket.org/workspace/repo2
+```
 
-* Python **3.9+**
+## Requirements
+
+* Python 3.9+
 * Git installed and available in PATH
-* Packages:
+* Python packages: `requests` (runtime) and `pyinstaller` (optional, for builds)
 
-  ```bash
-  pip install requests pyinstaller
-  ```
+Install runtime deps:
 
----
+```bash
+pip install requests
+```
 
-## ⚙️ Usage
+## Usage
 
-### 1. First run
-
-Run once to create a `.env` template:
+1. First run to create a `.env` template:
 
 ```bash
 python bb_sync.py
 ```
 
-If any required fields are missing, the script prints them and exits.
+2. Fill the `.env` with required fields (examples below). If `REPO_LIST` is empty
+   the tool will attempt to sync all repositories in the workspace/project.
 
----
-
-### 2. Fill the `.env`
-
-#### Example for Bitbucket Server/DC (project URL auto-detection)
+Example `.env` (Server/DC auto-detection):
 
 ```dotenv
-BITBUCKET_USER=rgranda.INDRA
-BITBUCKET_WORKSPACE=https://bitbucket.mova.indra.es/projects/PRECTICNTA
-BB_BASE_DIR=C:\Users\rgranda.INDRA\workspaces\NTA
+BITBUCKET_USER=your.user
+BITBUCKET_WORKSPACE=https://bitbucket.example.com/projects/PROJ
+BB_BASE_DIR=/home/you/workspaces
+REPO_LIST=
+INSECURE=true
+BITBUCKET_CA_BUNDLE=
+GIT_CA_BUNDLE=
+# Bitbucket Workspace Sync Tool
+
+[![Build](https://github.com/ramongranda/bitbucket-env-sync/actions/workflows/build.yml/badge.svg)](https://github.com/ramongranda/bitbucket-env-sync/actions/workflows/build.yml)
+[![Release](https://github.com/ramongranda/bitbucket-env-sync/actions/workflows/release.yml/badge.svg)](https://github.com/ramongranda/bitbucket-env-sync/actions/workflows/release.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+A simple cross-platform CLI to clone and update repositories from a Bitbucket
+workspace (Cloud) or project (Server/Data Center). It stores configuration and
+incremental sync metadata in a single `.env` file and is designed for simple,
+incremental repository synchronization.
+
+## Features
+
+* Supports Bitbucket Cloud and Bitbucket Server / Data Center.
+* Auth via Git Credential Manager (App Password / PAT prompt on first use).
+* Creates or updates `.env` automatically; exits if required values are missing.
+* `INSECURE=true` by default (skips TLS verification) for frictionless setup.
+* Supports corporate CA PEMs when `INSECURE=false`.
+* Incremental metadata written to `.env` per-repo: DEFAULT_BRANCH, LAST_SYNC,
+  LAST_STATUS, LAST_COMMIT, ACTIVE_BRANCH.
+
+## REPO_LIST format
+
+Repository URLs are stored in `REPO_LIST` as one URL per line (not comma-separated).
+Example:
+
+```env
+REPO_LIST=https://bitbucket.org/workspace/repo1
+https://bitbucket.org/workspace/repo2
+```
+
+## Requirements
+
+* Python 3.9+
+* Git installed and available in PATH
+* Python packages: `requests` (runtime) and `pyinstaller` (optional, for builds)
+
+Install runtime deps:
+
+```bash
+pip install requests
+```
+
+## Usage
+
+1. First run to create a `.env` template:
+
+```bash
+python bb_sync.py
+```
+
+2. Fill the `.env` with required fields (examples below). If `REPO_LIST` is empty
+   the tool will attempt to sync all repositories in the workspace/project.
+
+Example `.env` (Server/DC auto-detection):
+
+```dotenv
+BITBUCKET_USER=your.user
+BITBUCKET_WORKSPACE=https://bitbucket.example.com/projects/PROJ
+BB_BASE_DIR=/home/you/workspaces
 REPO_LIST=
 INSECURE=true
 BITBUCKET_CA_BUNDLE=
 GIT_CA_BUNDLE=
 ```
 
-#### Example for Bitbucket Cloud
+Example `.env` (Cloud):
 
 ```dotenv
 BITBUCKET_USER=myuser
 BITBUCKET_WORKSPACE=my-workspace
-BB_BASE_DIR=/home/myuser/workspaces/NTA
+BB_BASE_DIR=/home/myuser/workspaces
 REPO_LIST=
 INSECURE=true
-BITBUCKET_CA_BUNDLE=
-GIT_CA_BUNDLE=
 ```
 
-#### Example for explicit Server/DC configuration
+## Optional: automatic `.env` commits
 
-```dotenv
-BITBUCKET_USER=myuser
-BITBUCKET_BASE_URL=https://bitbucket.example.com
-BITBUCKET_PROJECT=PROJ
-BB_BASE_DIR=/home/myuser/workspaces/NTA
-REPO_LIST=repo-a,repo-b
-INSECURE=false
-BITBUCKET_CA_BUNDLE=/path/to/corporate.pem
-GIT_CA_BUNDLE=/path/to/corporate.pem
-```
+Set `AUTO_COMMIT_ENV=true` in `.env` to opt in. When enabled the tool will
+attempt to `git add .env` and `git commit -m "env: update <slug> <timestamp>"`
+in the repository root after each successful per-repo update. Failures are
+logged but do not stop the sync.
 
----
+**WARNING:** do NOT store secrets, PATs or credentials in `.env` if you enable
+this option. Prefer a separate non-sensitive metadata file if you need
+versioning.
 
-### 3. Run synchronization
+## Builds
 
-```bash
-python bb_sync.py
-```
-
-* If `REPO_LIST` is empty → syncs **all** repos.
-* If not → syncs only the listed ones.
-* Each successful operation **immediately updates `.env`** with metadata.
-
----
-
-## 🔑 Authentication (Option A — recommended)
-
-* **Server/DC** → Create a **Personal Access Token (PAT)** with read permissions.
-* **Cloud** → Create an **App Password**.
-* On the first run, Git Credential Manager will prompt:
-
-  * Username → your Bitbucket username
-  * Password → PAT/App Password
-* To cache credentials permanently:
-
-  ```bash
-  git config --global credential.helper manager-core
-  git config --global credential.interactive never
-  ```
-
----
-
-## 🔒 TLS / Corporate CA
-
-* Quick start: `INSECURE=true` (disables verification)
-* Production setup:
-
-  ```dotenv
-  INSECURE=false
-  BITBUCKET_CA_BUNDLE=/path/to/corporate.pem
-  GIT_CA_BUNDLE=/path/to/corporate.pem
-  ```
-
----
-
-## 🧱 Local builds
-
-### Windows
+Windows:
 
 ```powershell
 pyinstaller --onefile --name bb_sync bb_sync.py
 ```
 
-### Linux
+Linux:
 
 ```bash
 pyinstaller --onefile --name bb_sync_linux bb_sync.py
@@ -153,61 +178,31 @@ pyinstaller --onefile --name bb_sync_linux bb_sync.py
 
 Artifacts will appear in `dist/`.
 
----
+## CI / GitHub Actions
 
-## 🧹 Project layout
+The repository includes GitHub Actions workflows to build Windows and Linux
+binaries and to attach them to releases. The build workflow triggers on pushes
+to the `master` branch and on pull requests. Releases are produced from git tags
+(`v*`).
 
-```
-bitbucket-env-sync/
-├─ bb_sync.py
-├─ README.md
-├─ setup.cfg
-├─ pyproject.toml
-├─ Makefile
-├─ bb_sync.spec
-├─ .pre-commit-config.yaml
-├─ .gitignore
-└─ .github/workflows/
-   ├─ build.yml
-   └─ release.yml
-```
+## Development
 
----
-
-## 🥪 Development
-
-Install tools:
+Install developer tools:
 
 ```bash
-pip install pre-commit black isort pytest
+pip install pre-commit black isort flake8
 pre-commit install
 ```
 
-Run all checks manually:
+Run checks locally:
 
 ```bash
 pre-commit run --all-files
 black . && isort .
-pytest
+flake8
 ```
 
----
-
-## 🚚 CI/CD (GitHub Actions)
-
-* **build.yml** → builds Windows & Linux binaries on push/PR
-* **release.yml** → builds and attaches binaries to tagged releases
-
-Create a release:
-
-```bash
-git tag v0.1.0
-git push origin v0.1.0
-```
-
----
-
-## 🧮 Makefile shortcuts
+## Makefile shortcuts
 
 | Command            | Description                  |
 | ------------------ | ---------------------------- |
@@ -217,37 +212,11 @@ git push origin v0.1.0
 | `make build-all`   | Build both                   |
 | `make zip`         | Create deployable zip bundle |
 
----
+## License
 
-## 🗾 License (MIT)
+This project is licensed under the MIT License. See the `LICENSE` file for the
+full text.
 
-```
-MIT License
+## Author
 
-Copyright (c) 2025 Ramón Granda
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in
-all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-THE SOFTWARE.
-```
-
----
-
-## 👨‍💻 Author
-
-**Ramón Granda**
-Zoomiit · Asturias, Spain
+Ramón Granda — Zoomiit · Asturias, Spain
