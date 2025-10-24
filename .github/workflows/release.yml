@@ -28,25 +28,35 @@ jobs:
           python -m pip install --upgrade pip
           pip install pyinstaller
 
-      - name: Build
+      - name: Build (Linux)
+        if: runner.os != 'Windows'
+        shell: bash
         run: |
           pyinstaller --onefile --name bb_sync bb_sync.py
           echo "Built:";
           ls -la dist || true
 
-      - name: Rename binary to stable name
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
         run: |
-          set -e
-          echo "Runner OS = $RUNNER_OS"
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            # On Windows runner, PyInstaller produces dist/bb_sync.exe
-            mv dist/bb_sync.exe dist/bb_sync_Windows.exe || true
-            ls -l dist || true
-          else
-            # On Linux runner, PyInstaller produces dist/bb_sync
-            mv dist/bb_sync dist/bb_sync_Linux || true
-            ls -l dist || true
-          fi
+          pyinstaller --onefile --name bb_sync bb_sync.py
+          Write-Host 'Built:'
+          Get-ChildItem -Path dist
+
+      - name: Rename binary (Linux)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mv dist/bb_sync dist/bb_sync_Linux || true
+          ls -l dist || true
+
+      - name: Rename binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (Test-Path dist\bb_sync.exe) { Move-Item -Path dist\bb_sync.exe -Destination dist\bb_sync_Windows.exe -Force }
+          Get-ChildItem -Path dist
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
