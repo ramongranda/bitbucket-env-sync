@@ -10,7 +10,6 @@ It maintains a `.env` file with configuration and **incremental sync metadata** 
 
 ---
 
-
 # Bitbucket Workspace Sync Tool
 
 [![Build](https://github.com/ramongranda/bitbucket-env-sync/actions/workflows/build.yml/badge.svg)](https://github.com/ramongranda/bitbucket-env-sync/actions/workflows/build.yml)
@@ -216,9 +215,9 @@ flake8
 
 Get the latest binaries:
 
-- [Windows](https://github.com/ramongranda/bb-sync/releases/latest/download/bb_sync_Windows.zip)
-- [Linux](https://github.com/ramongranda/bb-sync/releases/latest/download/bb_sync_Linux.zip)
-- [All platforms (ZIP)](https://github.com/ramongranda/bb-sync/releases/latest/download/release_assets.zip)
+* [Windows](https://github.com/ramongranda/bb-sync/releases/latest/download/bb_sync_Windows.zip)
+* [Linux](https://github.com/ramongranda/bb-sync/releases/latest/download/bb_sync_Linux.zip)
+* [All platforms (ZIP)](https://github.com/ramongranda/bb-sync/releases/latest/download/release_assets.zip)
 
 ## License
 
