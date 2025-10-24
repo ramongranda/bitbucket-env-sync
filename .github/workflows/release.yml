@@ -42,6 +42,31 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: dist_all
+      - name: Determine release tag
+        id: get_tag
+        run: |
+          python - <<'PY'
+          import tomllib, os
+          tag = ''
+          try:
+              with open('pyproject.toml', 'rb') as f:
+                  data = tomllib.load(f)
+                  if isinstance(data, dict):
+                      tag = data.get('project', {}).get('version', '')
+                      if tag:
+                          tag = 'v' + tag
+          except Exception:
+              tag = ''
+          if not tag:
+              from datetime import datetime
+              sha = os.environ.get('GITHUB_SHA', '')
+              short = sha[:7] if sha else 'local'
+              tag = f"v{datetime.utcnow().strftime('%Y%m%d')}-{short}"
+          print(tag)
+          # Export to GITHUB_OUTPUT for step outputs
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write(f"tag={tag}\n")
+          PY
       - name: Zip artifacts
         run: |
           cd dist_all
@@ -51,8 +76,8 @@ jobs:
         id: create_release
         uses: actions/create-release@v1
         with:
-          tag_name: "release-${{ github.sha }}"
-          release_name: "Release ${{ github.sha }}"
+          tag_name: ${{ steps.get_tag.outputs.tag }}
+          release_name: "Release ${{ steps.get_tag.outputs.tag }}"
           body: "Automated release created from master push ${{ github.sha }}"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
