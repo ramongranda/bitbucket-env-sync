@@ -130,21 +130,20 @@ jobs:
         env:
           TAG: ${{ steps.get_tag.outputs.tag }}
 
-      - name: Upload all artifacts to release
+      - name: Install GitHub CLI
+        uses: cli/cli@v2
+        with:
+          version: latest
+
+      - name: Upload artifacts with gh
         env:
-          UPLOAD_URL: ${{ steps.create_release.outputs.result }}
-          TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.get_tag.outputs.tag }}
         run: |
           set -e
-          if [ -z "$UPLOAD_URL" ]; then
-            echo "No upload URL from release step"; exit 1
+          if [ ! -d dist_all ]; then
+            echo "dist_all not found"; exit 1
           fi
-          # Strip the URI template part {?:...} that GitHub returns (e.g. '{?name,label}').
-          BASE_URL="${UPLOAD_URL%%\{*}"
-          for f in dist_all/*; do
-            [ -f "$f" ] || continue
-            name=$(basename "$f")
-            echo "Uploading $name to release"
-            curl --fail -X POST -H "Authorization: token $TOKEN" -H "Content-Type: application/octet-stream" --data-binary @"$f" "${BASE_URL}?name=${name}"
-          done
+          echo "Uploading files in dist_all to release $TAG"
+          gh release upload "$TAG" dist_all/* --clobber
 
