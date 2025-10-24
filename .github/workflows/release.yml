@@ -123,27 +123,43 @@ jobs:
               } catch (e) {
                 rel = await github.rest.repos.createRelease({ owner: repo.owner, repo: repo.repo, tag_name: tag, name: `Release ${tag}`, body: `Automated release for ${tag}` })
               }
-              return rel.data.upload_url
+              return rel.data.id
             } catch (e) {
-              core.setFailed(e.message)
+              throw new Error(e.message)
             }
         env:
           TAG: ${{ steps.get_tag.outputs.tag }}
 
-      - name: Install GitHub CLI
-        uses: cli/cli@v2
+      - name: Upload artifacts via github-script
+        id: upload_assets
+        uses: actions/github-script@v6
         with:
-          version: latest
-
-      - name: Upload artifacts with gh
+          github-token: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs')
+            const path = require('path')
+            const repo = context.repo
+            const relId = parseInt(process.env.RELEASE_ID || '${{ steps.create_release.outputs.result }}', 10)
+            const dir = path.join(process.cwd(), 'dist_all')
+            if (!fs.existsSync(dir)) throw new Error('dist_all not found')
+            const files = fs.readdirSync(dir)
+            for (const f of files) {
+              const full = path.join(dir, f)
+              if (!fs.statSync(full).isFile()) continue
+              const data = fs.readFileSync(full)
+              console.log('Uploading', f)
+              await github.rest.repos.uploadReleaseAsset({
+                owner: repo.owner,
+                repo: repo.repo,
+                release_id: relId,
+                name: f,
+                data,
+                headers: {
+                  'content-type': 'application/octet-stream',
+                  'content-length': data.length
+                }
+              })
+            }
         env:
-          GITHUB_TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
-          TAG: ${{ steps.get_tag.outputs.tag }}
-        run: |
-          set -e
-          if [ ! -d dist_all ]; then
-            echo "dist_all not found"; exit 1
-          fi
-          echo "Uploading files in dist_all to release $TAG"
-          gh release upload "$TAG" dist_all/* --clobber
+          RELEASE_ID: ${{ steps.create_release.outputs.result }}
 
