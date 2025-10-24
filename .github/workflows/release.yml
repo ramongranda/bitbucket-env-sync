@@ -1,7 +1,10 @@
 name: Release
 
+# Trigger on tags (v*) and also on merges/pushes to master so we can create
+# an automatic release when code is merged to master.
 on:
   push:
+    branches: [ master ]
     tags:
       - "v*"
 
@@ -39,10 +42,25 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: dist_all
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+      - name: Zip artifacts
+        run: |
+          cd dist_all
+          zip -r ../release_assets.zip . || true
+
+      - name: Create GitHub release
+        id: create_release
+        uses: actions/create-release@v1
         with:
-          files: |
-            dist_all/**/*
+          tag_name: "release-${{ github.sha }}"
+          release_name: "Release ${{ github.sha }}"
+          body: "Automated release created from master push ${{ github.sha }}"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload release asset
+        uses: actions/upload-release-asset@v1
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: release_assets.zip
+          asset_name: release_assets.zip
+          asset_content_type: application/zip
