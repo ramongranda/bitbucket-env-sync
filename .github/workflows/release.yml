@@ -50,6 +50,16 @@ jobs:
           cd dist_all
           zip -r ../release_assets.zip . || true
 
+      - name: Ensure release token available
+        run: |
+          echo "Checking for RELEASE_PAT or GITHUB_TOKEN..."
+          if [ -z "${{ secrets.RELEASE_PAT }}" ] && [ -z "${{ secrets.GITHUB_TOKEN }}" ]; then
+            echo "--- ERROR: No release token available ---"
+            echo "Set a repository secret named RELEASE_PAT (a personal access token with 'repo' scope)"
+            echo "or enable GITHUB_TOKEN permissions for this workflow."
+            exit 1
+          fi
+
       - name: Determine release tag
         id: get_tag
         run: |
