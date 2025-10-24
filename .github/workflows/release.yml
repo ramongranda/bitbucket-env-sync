@@ -8,6 +8,10 @@ on:
     tags:
       - "v*"
 
+# Allow the workflow token to create releases and upload assets
+permissions:
+  contents: write
+
 jobs:
   build:
     strategy:
