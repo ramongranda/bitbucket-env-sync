@@ -1,51 +1,54 @@
 name: Release
 
-# Trigger on tags (v*) and also on merges/pushes to master so we can create
-# an automatic release when code is merged to master.
 on:
   push:
-    branches: [ master ]
-    tags:
-      - "v*"
+    branches: [master]
+    tags: ['v*']
 
-# Allow the workflow token to create releases and upload assets
 permissions:
   contents: write
 
 jobs:
   build:
+    name: Build binaries
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         os: [windows-latest, ubuntu-latest]
-        python-version: ["3.10"]
-    runs-on: ${{ matrix.os }}
+        python-version: ['3.10']
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install deps
+      - name: Install build deps
         run: |
-          pip install --upgrade pip
-          pip install requests pyinstaller
+          python -m pip install --upgrade pip
+          pip install pyinstaller
       - name: Build
         run: |
           pyinstaller --onefile --name bb_sync_${{ matrix.os }} bb_sync.py
-      - name: Upload artifacts
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: bb_sync_${{ matrix.os }}
           path: dist/*
 
   publish:
+    name: Create Release
     needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Download all artifacts
+      - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           path: dist_all
+
+      - name: Zip artifacts
+        run: |
+          cd dist_all
+          zip -r ../release_assets.zip . || true
 
       - name: Determine release tag
         id: get_tag
@@ -56,7 +59,6 @@ jobs:
           tag = ''
           try:
               txt = open('pyproject.toml', 'r', encoding='utf-8').read()
-              # Try to find a version = "x.y.z" line (works for [project] or tool.poetry)
               m = re.search(r'(?m)^[ \t]*version[ \t]*=[ \t]*["\']([^"\']+)["\']', txt)
               if m:
                   tag = 'v' + m.group(1)
@@ -71,192 +73,19 @@ jobs:
               out.write(f"tag={tag}\n")
           PY
 
-      - name: Zip artifacts
-        run: |
-          cd dist_all
-          zip -r ../release_assets.zip . || true
-
-      - name: Debug: check token can access repository
-        uses: actions/github-script@v6
-        with:
-          github-token: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
-          script: |
-            const repo = context.repo;
-            try {
-              const res = await github.rest.repos.get({ owner: repo.owner, repo: repo.repo });
-              console.log(`repo full_name: ${res.data.full_name}`);
-              console.log(`private: ${res.data.private}`);
-            } catch (e) {
-              console.warn(`repos.get failed: ${e.message}`);
-            }
-            // Try to list releases (permission check)
-            try {
-              const rel = await github.rest.repos.listReleases({ owner: repo.owner, repo: repo.repo, per_page: 1 });
-              console.log(`releases_count_sample: ${rel.data.length}`);
-            } catch (e) {
-              console.warn(`listReleases failed: ${e.message}`);
-            }
-        continue-on-error: true
-
-      - name: Create GitHub release (via github-script)
+      - name: Create release
         id: create_release
-        uses: actions/github-script@v6
+        uses: actions/create-release@v1
         with:
-          github-token: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
-          script: |
-            const repo = context.repo;
-            const tag = process.env.RELEASE_TAG || '${{ steps.get_tag.outputs.tag }}';
-            console.log(`Creating release for tag ${tag}`);
-            const res = await github.rest.repos.createRelease({
-              owner: repo.owner,
-              repo: repo.repo,
-              tag_name: tag,
-              name: `Release ${tag}`,
-              body: `Automated release created from master push ${process.env.GITHUB_SHA || ''}`,
-              draft: false,
-              prerelease: false,
-            });
-            console.log(`release created: ${res.data.html_url}`);
-            return res.data.upload_url;
-        env:
-          GITHUB_SHA: ${{ github.sha }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: ${{ steps.get_tag.outputs.tag }}
+          release_name: Release ${{ steps.get_tag.outputs.tag }}
+          body: Automated release created from master push ${{ github.sha }}
 
       - name: Upload release asset
         uses: actions/upload-release-asset@v1
         with:
-          upload_url: ${{ steps.create_release.outputs.result }}
-          asset_path: release_assets.zip
-          asset_name: release_assets.zip
-          asset_content_type: application/zip
-name: Release
-
-# Trigger on tags (v*) and also on merges/pushes to master so we can create
-# an automatic release when code is merged to master.
-on:
-  push:
-    branches: [ master ]
-    tags:
-      - "v*"
-
-# Allow the workflow token to create releases and upload assets
-permissions:
-  contents: write
-
-jobs:
-  build:
-    strategy:
-      matrix:
-        os: [windows-latest, ubuntu-latest]
-        python-version: ["3.10"]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-      - name: Install deps
-        run: |
-          pip install --upgrade pip
-          pip install requests pyinstaller
-      - name: Build
-        run: |
-          pyinstaller --onefile --name bb_sync_${{ matrix.os }} bb_sync.py
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        publish:
-          needs: build
-          runs-on: ubuntu-latest
-          steps:
-            - uses: actions/checkout@v4
-            - name: Download all artifacts
-              uses: actions/download-artifact@v4
-              with:
-                path: dist_all
-
-            - name: Determine release tag
-              id: get_tag
-              run: |
-                python - <<'PY'
-                import re, os
-                from datetime import datetime
-                tag = ''
-                try:
-                    txt = open('pyproject.toml', 'r', encoding='utf-8').read()
-                    # Try to find a version = "x.y.z" line (works for [project] or tool.poetry)
-                    m = re.search(r'(?m)^[ \t]*version[ \t]*=[ \t]*["\']([^"\']+)["\']', txt)
-                    if m:
-                        tag = 'v' + m.group(1)
-                except Exception:
-                    tag = ''
-                if not tag:
-                    sha = os.environ.get('GITHUB_SHA', '')
-                    short = sha[:7] if sha else 'local'
-                    tag = f"v{datetime.utcnow().strftime('%Y%m%d')}-{short}"
-                print(tag)
-                with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
-                    out.write(f"tag={tag}\n")
-                PY
-
-            - name: Zip artifacts
-              run: |
-                cd dist_all
-                zip -r ../release_assets.zip . || true
-
-            - name: Debug: check token can access repository
-              uses: actions/github-script@v6
-              with:
-                github-token: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
-                script: |
-                  const repo = context.repo;
-                  try {
-                    const res = await github.rest.repos.get({ owner: repo.owner, repo: repo.repo });
-                    console.log(`repo full_name: ${res.data.full_name}`);
-                    console.log(`private: ${res.data.private}`);
-                  } catch (e) {
-                    console.warn(`repos.get failed: ${e.message}`);
-                  }
-                  // Try to list releases (permission check)
-                  try {
-                    const rel = await github.rest.repos.listReleases({ owner: repo.owner, repo: repo.repo, per_page: 1 });
-                    console.log(`releases_count_sample: ${rel.data.length}`);
-                  } catch (e) {
-                    console.warn(`listReleases failed: ${e.message}`);
-                  }
-              continue-on-error: true
-
-            - name: Create GitHub release (via github-script)
-              id: create_release
-              uses: actions/github-script@v6
-              with:
-                github-token: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
-                script: |
-                  const repo = context.repo;
-                  const tag = process.env.RELEASE_TAG || '${{ steps.get_tag.outputs.tag }}';
-                  console.log(`Creating release for tag ${tag}`);
-                  const res = await github.rest.repos.createRelease({
-                    owner: repo.owner,
-                    repo: repo.repo,
-                    tag_name: tag,
-                    name: `Release ${tag}`,
-                    body: `Automated release created from master push ${process.env.GITHUB_SHA || ''}`,
-                    draft: false,
-                    prerelease: false,
-                  });
-                  console.log(`release created: ${res.data.html_url}`);
-                  return res.data.upload_url;
-              env:
-                GITHUB_SHA: ${{ github.sha }}
-
-            - name: Upload release asset
-              uses: actions/upload-release-asset@v1
-              with:
-                upload_url: ${{ steps.create_release.outputs.result }}
-                asset_path: release_assets.zip
-                asset_name: release_assets.zip
-                asset_content_type: application/zip
-        uses: actions/upload-release-asset@v1
-        with:
-          upload_url: ${{ steps.create_release.outputs.result }}
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
           asset_path: release_assets.zip
           asset_name: release_assets.zip
           asset_content_type: application/zip
