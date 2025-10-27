@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -14,7 +16,6 @@ Funciones clave:
 
 Requisitos: Python 3.9+, git, requests.
 """
-from __future__ import annotations
 
 import contextlib
 import getpass
@@ -28,7 +29,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Tuple, List
+from typing import List, Optional, Tuple
 from urllib.parse import urlparse
 
 import requests
@@ -41,6 +42,13 @@ DEBUG = str(os.environ.get("BB_SYNC_DEBUG", "0")).lower() in ("1", "true", "yes"
 # =========================================================
 # util / logging
 # =========================================================
+
+def write_repo_audit(url: str, sync_date: str, branch: str) -> None:
+    audit_file = Path(__file__).resolve().parent / ".repo_audit"
+    line = f"{url} | {sync_date} | {branch}\n"
+    with open(audit_file, "a", encoding="utf-8") as f:
+        f.write(line)
+
 
 def log_debug(msg: str) -> None:
     if DEBUG:
@@ -507,23 +515,7 @@ def first_auth(env_map: dict) -> tuple[str, str]:
 # =========================================================
 
 def update_env_repo(slug: str, url: str, def_branch: str, status: str, repo_dir: Path) -> None:
-    existing = load_env_file()
-    try:
-        migrate_old_repo_keys(existing)
-    except Exception:
-        pass
-    try:
-        ensure_url_in_repo_list(existing, url)
-    except Exception:
-        pass
-    key_base = (slug or "repo").replace("-", "_").upper()
-    if def_branch:
-        existing[f"REPO_{key_base}_DEFAULT_BRANCH"] = def_branch
-    existing[f"REPO_{key_base}_LAST_SYNC"] = now_iso_utc()
-    existing[f"REPO_{key_base}_LAST_STATUS"] = status
-    existing[f"REPO_{key_base}_LAST_COMMIT"] = local_short_commit(repo_dir) or ""
-    existing[f"REPO_{key_base}_ACTIVE_BRANCH"] = local_active_branch(repo_dir) or ""
-    write_env(existing)
+    pass  # Eliminado: ahora el registro se hará en .repo_audit
 
 # =========================================================
 # core env + discovery
@@ -620,12 +612,18 @@ def ensure_repo_list(env_map: dict) -> List[str]:
 
 def ensure_basedir(path_str: str) -> Path:
     # evita errores si por accidente ponen rutas Windows dentro de WSL
-    p = Path(path_str.replace("\\", "/")).expanduser().resolve()
+    p_str = path_str.replace("\\", "/")
+    # Convertir rutas de Windows a WSL si estamos en WSL y la ruta parece de Windows
+    if os.name != "nt" and (p_str.startswith("C:/") or p_str.startswith("D:/") or p_str.startswith("E:/")):
+        drive = p_str[0].lower()
+        rest = p_str[3:]
+        p_str = f"/mnt/{drive}{rest}"
+    p = Path(p_str).expanduser().resolve()
     p.mkdir(parents=True, exist_ok=True)
     return p
 
 
-def clone_or_update(repo: Repo, base_dir: Path, insecure: bool, ca_bundle: Optional[str]) -> Tuple[str, Path]:
+def clone_or_update(repo: Repo, base_dir: Path, insecure: bool, ca_bundle: Optional[str], shallow: bool) -> Tuple[str, Path]:
     name = repo.slug or Path(urlparse(repo.url).path).name.replace(".git", "")
     dest = base_dir / name
     if dest.exists() and (dest / ".git").exists():
@@ -652,8 +650,12 @@ def clone_or_update(repo: Repo, base_dir: Path, insecure: bool, ca_bundle: Optio
         return ("error", dest)
     else:
         print(f"\nClonando {name} desde {repo.url} …")
+        clone_cmd = ["clone"]
+        if shallow:
+            clone_cmd.extend(["--depth", "1"])
+        clone_cmd.extend([repo.url, str(dest)])
         rc = run_git(
-            ["clone", repo.url, str(dest)],
+            clone_cmd,
             insecure=insecure,
             git_ca_bundle=ca_bundle,
             stream_output=True,
@@ -681,12 +683,15 @@ def main() -> int:
     insecure = str2bool(env.get("INSECURE", "true"))
     ca_bundle = env.get("CA_BUNDLE") or env.get("BITBUCKET_CA_BUNDLE") or env.get("GIT_CA_BUNDLE") or None
     VERIFY = False if insecure else (ca_bundle if ca_bundle else True)
+    shallow = str2bool(env.get("SHALLOW_CLONE", "false"))
 
+    # Descubre/lee la lista (también asegura credenciales)
+    cred_host = resolve_bitbucket_host(env)
     # Descubre/lee la lista (también asegura credenciales)
     cred_host = resolve_bitbucket_host(env)
     urls = ensure_repo_list(env)
     if not urls:
-        print("[ERR] REPO_LIST vacío y no se pudo descubrir nada.")
+        print("[ERR] No se encontraron repositorios para sincronizar.")
         return 2
 
     base_dir = ensure_basedir(env.get("BB_BASE_DIR", "./repos"))
@@ -699,20 +704,18 @@ def main() -> int:
     # Procesa todos
     for url in urls:
         repo = parse_repo_url(url)
-        # Garantiza que esté en REPO_LIST por si lanzas el script con URL externa
-        env2 = load_env_file()
-        if ensure_url_in_repo_list(env2, url):
-            write_env(env2)
-
-        status, repo_dir = clone_or_update(repo, base_dir, insecure, ca_bundle)
+        # No modificar REPO_LIST durante sincronización; solo auditar
+        _, repo_dir = clone_or_update(repo, base_dir, insecure, ca_bundle, shallow)
         try:
             dbranch = default_branch(repo_dir)
         except Exception:
             dbranch = ""
         try:
-            update_env_repo(repo.slug or "repo", url, dbranch, status, repo_dir)
+            sync_date = now_iso_utc()
+            branch = dbranch or local_active_branch(repo_dir)
+            write_repo_audit(url, sync_date, branch)
         except Exception as e:
-            print(f"[WARN] No se pudo actualizar metadatos .env para {url}: {e}")
+            print(f"[WARN] No se pudo registrar auditoría para {url}: {e}")
 
     print("\nTodo listo. Repos sincronizados/actualizados.")
     return 0
