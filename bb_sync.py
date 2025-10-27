@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Bitbucket Env Sync CLI – auto-discovery + .env interactive + spinner
+Bitbucket Env Sync CLI – desde cero
 
-• Si .env NO existe → se crea con defaults y se piden los mínimos.
-• Si REPO_LIST está vacío → descubre los repos del workspace/proyecto por API
-  (Bitbucket Server/DC o Cloud) y los guarda en .env (uno por línea).
-• Valida credenciales contra el PRIMER repo encontrado antes de clonar.
-• Clona/actualiza todos los repos en BB_BASE_DIR con spinner.
-• Actualiza metadatos por repo en .env (DEFAULT_BRANCH, LAST_SYNC, etc.).
+Funciones clave:
+- Lee/crea .env con bloqueo de archivo y escritura atómica.
+- Pide campos obligatorios si faltan (solo la primera vez).
+- Pre-carga credenciales en ~/.git-credentials (git credential.helper=store).
+- Si REPO_LIST está vacío: descubre repos por API (Server/DC o Cloud) y rellena .env.
+- Valida acceso contra el primer repo antes de clonar.
+- Clona/actualiza todos los repos en BB_BASE_DIR con spinner.
+- Actualiza metadatos por repo en .env (DEFAULT_BRANCH, LAST_SYNC, etc.).
 
 Requisitos: Python 3.9+, git, requests.
 """
@@ -26,7 +28,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterator, Optional, Tuple, List
+from typing import Optional, Tuple, List
 from urllib.parse import urlparse
 
 import requests
@@ -40,7 +42,7 @@ DEBUG = str(os.environ.get("BB_SYNC_DEBUG", "0")).lower() in ("1", "true", "yes"
 # util / logging
 # =========================================================
 
-def log_debug(msg: str):
+def log_debug(msg: str) -> None:
     if DEBUG:
         sys.stderr.write(f"[debug] {msg}\n")
         sys.stderr.flush()
@@ -63,7 +65,7 @@ class Spinner:
         self._stop = threading.Event()
         self._th: Optional[threading.Thread] = None
 
-    def start(self):
+    def start(self) -> None:
         def run():
             i = 0
             frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
@@ -75,7 +77,7 @@ class Spinner:
         self._th = threading.Thread(target=run, daemon=True)
         self._th.start()
 
-    def stop(self, suffix: str = " listo"):
+    def stop(self, suffix: str = " listo") -> None:
         self._stop.set()
         if self._th:
             self._th.join(timeout=1)
@@ -137,7 +139,7 @@ def file_lock(target_path: Path, timeout: float = 10.0):
         except Exception:
             pass
 
-def ensure_env_parent():
+def ensure_env_parent() -> None:
     ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 
@@ -162,7 +164,7 @@ def load_env_file() -> dict:
     return env
 
 
-def write_env(env_map: dict):
+def write_env(env_map: dict) -> None:
     ensure_env_parent()
     lines = [
         "# Bitbucket Sync .env",
@@ -258,7 +260,7 @@ def http_get(url: str, auth, params=None) -> requests.Response:
     return requests.get(url, auth=auth, params=params, timeout=60, verify=VERIFY)
 
 
-def list_repo_clone_urls_server(base_url: str, project: str, auth) -> List[str]:
+def list_repo_clone_urls_server(base_url: str, project: str, auth, cred_host: str) -> List[str]:
     """Devuelve HTTPS clone URLs de todos los repos del proyecto (Server/DC)."""
     urls, start = [], 0
     while True:
@@ -268,6 +270,7 @@ def list_repo_clone_urls_server(base_url: str, project: str, auth) -> List[str]:
             params={"limit": 100, "start": start},
         )
         if r.status_code in (401, 403):
+            remove_git_credentials(cred_host)
             raise SystemExit("[AUTH] Credenciales inválidas para Server/DC")
         if r.status_code != 200:
             raise SystemExit(f"[ERR] Server API {r.status_code}: {r.text[:200]}")
@@ -283,7 +286,7 @@ def list_repo_clone_urls_server(base_url: str, project: str, auth) -> List[str]:
     return urls
 
 
-def list_repo_clone_urls_cloud(workspace: str, auth) -> List[str]:
+def list_repo_clone_urls_cloud(workspace: str, auth, cred_host: str) -> List[str]:
     """Devuelve HTTPS clone URLs de todos los repos del workspace (Cloud)."""
     urls = []
     url = f"{API_CLOUD}/repositories/{workspace}"
@@ -291,6 +294,7 @@ def list_repo_clone_urls_cloud(workspace: str, auth) -> List[str]:
     while True:
         r = http_get(url, auth, params=params)
         if r.status_code in (401, 403):
+            remove_git_credentials(cred_host)
             raise SystemExit("[AUTH] Credenciales inválidas para Cloud")
         if r.status_code != 200:
             raise SystemExit(f"[ERR] Cloud API {r.status_code}: {r.text[:200]}")
@@ -307,7 +311,7 @@ def list_repo_clone_urls_cloud(workspace: str, auth) -> List[str]:
     return urls
 
 
-def validate_first_repo(repo: Repo, auth) -> None:
+def validate_first_repo(repo: Repo, auth, cred_host: str) -> None:
     """Valida credenciales contra un repo concreto antes de clonar."""
     if repo.kind == "cloud" and repo.workspace and repo.slug:
         api = f"{API_CLOUD}/repositories/{repo.workspace}/{repo.slug}"
@@ -316,6 +320,7 @@ def validate_first_repo(repo: Repo, auth) -> None:
         if r.status_code == 200:
             return
         if r.status_code in (401, 403):
+            remove_git_credentials(cred_host)
             raise SystemExit("[AUTH] Credenciales inválidas para Bitbucket Cloud (401/403)")
         raise SystemExit(f"[ERR] Cloud API {r.status_code}: {r.text[:200]}")
     # Server/DC
@@ -330,6 +335,7 @@ def validate_first_repo(repo: Repo, auth) -> None:
     if r.status_code == 200:
         return
     if r.status_code in (401, 403):
+        remove_git_credentials(cred_host)
         raise SystemExit("[AUTH] Credenciales inválidas para Bitbucket Server/DC (401/403)")
     raise SystemExit(f"[ERR] Server API {r.status_code}: {r.text[:200]}")
 
@@ -377,10 +383,111 @@ def default_branch(repo_dir: Path) -> str:
     return ""
 
 # =========================================================
+# pre-carga de credenciales (git store)
+# =========================================================
+
+def _match_credential_host(line: str, host: str) -> bool:
+    try:
+        parsed = urlparse(line.strip())
+        netloc = parsed.netloc or ""
+        host_part = netloc.rsplit("@", 1)[-1]
+        return host_part.lower() == host.lower()
+    except Exception:
+        return False
+
+
+def ensure_git_credentials_store(host: str, user: str, password: str) -> None:
+    """Garantiza que ~/.git-credentials contiene https://user:password@host y helper=store."""
+    cred_file = Path.home() / ".git-credentials"
+    cred_file.parent.mkdir(parents=True, exist_ok=True)
+    entry = f"https://{user}:{password}@{host}\n"
+    existing_lines: list[str] = []
+    if cred_file.exists():
+        try:
+            existing_lines = [
+                line for line in cred_file.read_text(encoding="utf-8", errors="ignore").splitlines() if line.strip()
+            ]
+        except Exception:
+            existing_lines = []
+
+    filtered = [line for line in existing_lines if not _match_credential_host(line, host)]
+    filtered.append(entry.strip())
+
+    with cred_file.open("w", encoding="utf-8") as f:
+        f.write("\n".join(filtered) + "\n")
+    try:
+        cred_file.chmod(0o600)
+    except Exception:
+        pass
+    subprocess.run(["git", "config", "--global", "credential.helper", "store"], check=False)
+
+
+def load_or_prompt_credentials(host: str) -> tuple[str, str]:
+    """Obtiene credenciales desde git-store; permite sobrescribirlas si el usuario lo desea."""
+    cred_file = Path.home() / ".git-credentials"
+    stored: Optional[tuple[str, str]] = None
+    if cred_file.exists():
+        try:
+            for line in cred_file.read_text(encoding="utf-8", errors="ignore").splitlines():
+                if host in line and "@" in line:
+                    m = re.match(r"https://([^:]+):([^@]+)@", line)
+                    if m:
+                        stored = (m.group(1), m.group(2))
+                        break
+        except Exception:
+            stored = None
+
+    if stored:
+        reuse = input(
+            f"Se encontraron credenciales guardadas para {host}. ¿Usarlas? [Enter = sí / n = no]: "
+        ).strip().lower()
+        if reuse in ("", "s", "si", "sí", "y", "yes"):
+            return stored
+        print("Introduce nuevas credenciales.")
+
+    user = input("Usuario Bitbucket: ").strip()
+    password = getpass.getpass("App Password: ").strip()
+    if not user or not password:
+        raise SystemExit("Usuario y App Password son obligatorios.")
+    ensure_git_credentials_store(host, user, password)
+    return user, password
+
+
+def remove_git_credentials(host: str) -> None:
+    """Elimina credenciales almacenadas para un host dado."""
+    cred_file = Path.home() / ".git-credentials"
+    if not cred_file.exists():
+        return
+    try:
+        lines = [line for line in cred_file.read_text(encoding="utf-8", errors="ignore").splitlines()]
+    except Exception:
+        return
+    filtered = [line for line in lines if not _match_credential_host(line, host)]
+    if len(filtered) == len(lines):
+        return
+    with cred_file.open("w", encoding="utf-8") as f:
+        f.write(("\n".join(filtered) + "\n") if filtered else "")
+
+
+def resolve_bitbucket_host(env_map: dict) -> str:
+    if env_map.get("BITBUCKET_BASE_URL"):
+        return urlparse(env_map["BITBUCKET_BASE_URL"]).netloc
+    if env_map.get("BITBUCKET_WORKSPACE"):
+        return "bitbucket.org"
+    return "bitbucket.mova.indra.es"
+
+
+def first_auth(env_map: dict) -> tuple[str, str]:
+    """Obtiene (usuario, password) desde git-store; si no existen, los solicita y guarda."""
+    host = resolve_bitbucket_host(env_map)
+    user, pw = load_or_prompt_credentials(host)
+    return user, pw
+
+# =========================================================
 # per-repo metadata in .env
 # =========================================================
 
-def update_env_repo(slug: str, url: str, def_branch: str, status: str, repo_dir: Path):
+def update_env_repo(slug: str, url: str, def_branch: str, status: str, repo_dir: Path) -> None:
     existing = load_env_file()
     try:
         migrate_old_repo_keys(existing)
@@ -416,10 +523,6 @@ def ensure_env_defaults() -> Tuple[dict, List[str]]:
         write_env(env_map)
 
     missing: List[str] = []
-    if not env_map.get("BITBUCKET_USER"):
-        missing.append("BITBUCKET_USER")
-    if not (env_map.get("BB_PASSWORD") or env_map.get("BITBUCKET_APP_PASSWORD")):
-        missing.append("BB_PASSWORD (o BITBUCKET_APP_PASSWORD)")
     if not env_map.get("BB_BASE_DIR"):
         missing.append("BB_BASE_DIR")
     if not env_map.get("BITBUCKET_WORKSPACE") and not (env_map.get("BITBUCKET_BASE_URL") and env_map.get("BITBUCKET_PROJECT")):
@@ -430,17 +533,11 @@ def ensure_env_defaults() -> Tuple[dict, List[str]]:
 
 def prompt_missing(env_map: dict, missing_keys: List[str]) -> dict:
     print("Config .env incompleta. Te pido los datos mínimos:")
-    mk = ", ".join(missing_keys)
-    if "BITBUCKET_USER" in mk:
-        env_map["BITBUCKET_USER"] = input("BITBUCKET_USER: ").strip()
-    if "BB_PASSWORD" in mk or "BITBUCKET_APP_PASSWORD" in mk:
-        pw = getpass.getpass("App Password / BB_PASSWORD: ")
-        if pw:
-            env_map["BB_PASSWORD"] = pw
-    if "BB_BASE_DIR" in mk:
+    # Se solicitan datos de ruta y destino Bitbucket; credenciales se piden aparte.
+    if "BB_BASE_DIR" in missing_keys:
         base = input("BB_BASE_DIR (ruta donde clonar): ").strip()
         env_map["BB_BASE_DIR"] = base or str((Path.home() / "bitbucket").resolve())
-    if "BITBUCKET_WORKSPACE o (BITBUCKET_BASE_URL y BITBUCKET_PROJECT)" in mk:
+    if "BITBUCKET_WORKSPACE o (BITBUCKET_BASE_URL y BITBUCKET_PROJECT)" in missing_keys:
         ws = input("BITBUCKET_WORKSPACE (Cloud) [deja vacío si usas Server]: ").strip()
         if ws:
             env_map["BITBUCKET_WORKSPACE"] = ws
@@ -459,17 +556,18 @@ def ensure_repo_list(env_map: dict) -> List[str]:
     if urls:
         return [normalize_url_for_list(u) for u in urls]
 
-    auth = (env_map.get("BITBUCKET_USER"), env_map.get("BB_PASSWORD") or env_map.get("BITBUCKET_APP_PASSWORD"))
+    auth = first_auth(env_map)
+    cred_host = resolve_bitbucket_host(env_map)
     workspace = (env_map.get("BITBUCKET_WORKSPACE") or "").strip()
     base_url = (env_map.get("BITBUCKET_BASE_URL") or "").strip()
     project = (env_map.get("BITBUCKET_PROJECT") or "").strip()
 
     if base_url and project:
         print(f"[INFO] Descubriendo repos en {base_url} proyecto {project} …")
-        discovered = list_repo_clone_urls_server(base_url, project, auth)
+        discovered = list_repo_clone_urls_server(base_url, project, auth, cred_host)
     elif workspace:
         print(f"[INFO] Descubriendo repos en workspace Cloud {workspace} …")
-        discovered = list_repo_clone_urls_cloud(workspace, auth)
+        discovered = list_repo_clone_urls_cloud(workspace, auth, cred_host)
     else:
         raise SystemExit("[ERR] Falta destino: define BITBUCKET_WORKSPACE (Cloud) o BITBUCKET_BASE_URL+BITBUCKET_PROJECT (Server).")
 
@@ -492,12 +590,6 @@ def ensure_basedir(path_str: str) -> Path:
     p = Path(path_str.replace("\\", "/")).expanduser().resolve()
     p.mkdir(parents=True, exist_ok=True)
     return p
-
-
-def first_auth(env_map: dict):
-    user = env_map.get("BITBUCKET_USER")
-    pw = env_map.get("BB_PASSWORD") or env_map.get("BITBUCKET_APP_PASSWORD")
-    return (user, pw)
 
 
 def clone_or_update(repo: Repo, base_dir: Path, insecure: bool, ca_bundle: Optional[str]) -> Tuple[str, Path]:
@@ -529,24 +621,25 @@ def main() -> int:
     if missing:
         env = prompt_missing(env, missing)
 
-    # Config TLS/verify a partir de .env
+    # TLS/verify desde .env
     global VERIFY
     insecure = str2bool(env.get("INSECURE", "true"))
     ca_bundle = env.get("CA_BUNDLE") or env.get("BITBUCKET_CA_BUNDLE") or env.get("GIT_CA_BUNDLE") or None
     VERIFY = False if insecure else (ca_bundle if ca_bundle else True)
 
-    # Descubre/lee la lista
+    # Descubre/lee la lista (también asegura credenciales)
+    cred_host = resolve_bitbucket_host(env)
     urls = ensure_repo_list(env)
     if not urls:
         print("[ERR] REPO_LIST vacío y no se pudo descubrir nada.")
         return 2
 
     base_dir = ensure_basedir(env.get("BB_BASE_DIR", "./repos"))
-    auth = first_auth(env)
 
     # Valida contra el primer repo
     first_repo = parse_repo_url(urls[0])
-    validate_first_repo(first_repo, auth)
+    user, pw = first_auth(env)  # asegura que creds existen
+    validate_first_repo(first_repo, (user, pw), cred_host)
 
     # Procesa todos
     for url in urls:
