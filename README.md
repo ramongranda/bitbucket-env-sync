@@ -4,18 +4,6 @@
 [![Release](https://github.com/ramongranda/bitbucket-env-sync/actions/workflows/release.yml/badge.svg)](https://github.com/ramongranda/bitbucket-env-sync/actions/workflows/release.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A simple cross-platform CLI to **clone and update all repositories** from a Bitbucket
-workspace (Cloud) or project (Server/Data Center).
-It maintains a `.env` file with configuration and **incremental sync metadata** per repository.
-
----
-
-# Bitbucket Workspace Sync Tool
-
-[![Build](https://github.com/ramongranda/bitbucket-env-sync/actions/workflows/build.yml/badge.svg)](https://github.com/ramongranda/bitbucket-env-sync/actions/workflows/build.yml)
-[![Release](https://github.com/ramongranda/bitbucket-env-sync/actions/workflows/release.yml/badge.svg)](https://github.com/ramongranda/bitbucket-env-sync/actions/workflows/release.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-
 A simple cross-platform CLI to clone and update repositories from a Bitbucket
 workspace (Cloud) or project (Server/Data Center). It stores configuration and
 incremental sync metadata in a single `.env` file and is designed for simple,
