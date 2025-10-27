@@ -1,75 +1,103 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Bitbucket Env Sync CLI
+Bitbucket Env Sync CLI – auto-discovery + .env interactive + spinner
 
-English Documentation for Maintainers and AI Agents:
+• Si .env NO existe → se crea con defaults y se piden los mínimos.
+• Si REPO_LIST está vacío → descubre los repos del workspace/proyecto por API
+  (Bitbucket Server/DC o Cloud) y los guarda en .env (uno por línea).
+• Valida credenciales contra el PRIMER repo encontrado antes de clonar.
+• Clona/actualiza todos los repos en BB_BASE_DIR con spinner.
+• Actualiza metadatos por repo en .env (DEFAULT_BRANCH, LAST_SYNC, etc.).
 
-Overview:
-- Python CLI tool to synchronize Bitbucket Cloud and Server/DC repositories.
-- Main configuration and sync state are stored in `.env` (auto-created/updated).
-- Supports incremental sync and per-repo metadata tracking.
-
-Main Flow:
-1. Checks/creates `.env` and prompts for required fields if missing.
-2. Detects Cloud/Server mode based on `.env` variables.
-3. Syncs all repositories or only those listed in `REPO_LIST`.
-4. Updates per-repo metadata in `.env` after each successful operation.
-
-Key Patterns:
-- `.env` is the only persistent state; always use atomic write and file lock helpers.
-- Per-repo metadata keys: `REPO_<SLUG>_DEFAULT_BRANCH`, `REPO_<SLUG>_LAST_SYNC`, etc.
-- Repository URLs are managed in the comma-separated `REPO_LIST`.
-- Authentication via Git Credential Manager (PAT/App Password prompt on first use).
-- Default is `INSECURE=true` for easy setup; use corporate CA and `INSECURE=false` for production.
-
-Development Workflows:
-- Install dependencies: `make install` or `pip install requests pyinstaller`
-- Run sync: `python bb_sync.py` (creates `.env` if missing)
-- Build binary: Windows: `make build-win`, Linux: `make build-linux`
-- Format/lint: `black . && isort .`, `pre-commit run --all-files`
-- Run tests: `pytest`
-
-Example `.env` Metadata:
-REPO_LIST=https://bitbucket.org/workspace/repo1,https://bitbucket.org/workspace/repo2
-REPO_REPO1_DEFAULT_BRANCH=main
-REPO_REPO1_LAST_SYNC=2025-10-24T12:34:56Z
-REPO_REPO1_LAST_STATUS=updated
-REPO_REPO1_LAST_COMMIT=abc123
-REPO_REPO1_ACTIVE_BRANCH=main
-
-Requirements: Python 3.9+, Git in PATH, requests (pip install requests)
+Requisitos: Python 3.9+, git, requests.
 """
+from __future__ import annotations
 
+import contextlib
+import getpass
 import os
 import re
-import sys
 import subprocess
+import sys
+import tempfile
+import threading
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator, Optional, Tuple, List
 from urllib.parse import urlparse
-from datetime import datetime, timezone
-import requests
 
-# Nuevos imports
-import tempfile
-import time
-import contextlib
+import requests
 
 API_CLOUD = "https://api.bitbucket.org/2.0"
 ENV_FILE = Path(__file__).resolve().parent / ".env"
 VERIFY: object = True  # True | False | path-to-PEM
+DEBUG = str(os.environ.get("BB_SYNC_DEBUG", "0")).lower() in ("1", "true", "yes", "y")
+
+# =========================================================
+# util / logging
+# =========================================================
+
+def log_debug(msg: str):
+    if DEBUG:
+        sys.stderr.write(f"[debug] {msg}\n")
+        sys.stderr.flush()
 
 
-# ---------- .env helpers ----------
+def now_iso_utc() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def str2bool(s: str) -> bool:
+    return str(s).lower() in ("1", "true", "yes", "y")
+
+# =========================================================
+# spinner
+# =========================================================
+
+class Spinner:
+    def __init__(self, text: str = "Procesando"):
+        self.text = text
+        self._stop = threading.Event()
+        self._th: Optional[threading.Thread] = None
+
+    def start(self):
+        def run():
+            i = 0
+            frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+            while not self._stop.is_set():
+                sys.stdout.write(f"\r{self.text} {frames[i % len(frames)]}")
+                sys.stdout.flush()
+                time.sleep(0.08)
+                i += 1
+        self._th = threading.Thread(target=run, daemon=True)
+        self._th.start()
+
+    def stop(self, suffix: str = " listo"):
+        self._stop.set()
+        if self._th:
+            self._th.join(timeout=1)
+        sys.stdout.write(f"\r{self.text}{suffix}\n")
+        sys.stdout.flush()
+
+@contextlib.contextmanager
+def spinning(text: str):
+    sp = Spinner(text)
+    sp.start()
+    try:
+        yield sp
+    finally:
+        sp.stop()
+
+# =========================================================
+# .env helpers (lock + atomic write)
+# =========================================================
+
 @contextlib.contextmanager
 def file_lock(target_path: Path, timeout: float = 10.0):
-    """
-    Simple cross-platform lock using a .lock file plus fcntl/msvcrt.
-    Blocks until lock acquired or timeout. Removes lockfile on release.
-    """
     lock_path = Path(str(target_path) + ".lock")
-    # Open lock file for writing (create if missing)
     f = open(lock_path, "w")
     try:
         start = time.time()
@@ -77,16 +105,12 @@ def file_lock(target_path: Path, timeout: float = 10.0):
             try:
                 if os.name == "nt":
                     import msvcrt
-
-                    # Try non-blocking lock of one byte
                     msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
                 else:
                     import fcntl
-
                     fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                 break
             except Exception:
-                # Could be BlockingIOError or OSError depending on platform
                 if time.time() - start > timeout:
                     f.close()
                     raise TimeoutError(f"Timeout acquiring lock on {lock_path}")
@@ -97,11 +121,9 @@ def file_lock(target_path: Path, timeout: float = 10.0):
             try:
                 if os.name == "nt":
                     import msvcrt
-
                     msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
                 else:
                     import fcntl
-
                     fcntl.flock(f.fileno(), fcntl.LOCK_UN)
             except Exception:
                 pass
@@ -110,16 +132,17 @@ def file_lock(target_path: Path, timeout: float = 10.0):
             f.close()
         except Exception:
             pass
-        # Try to remove lockfile (best-effort)
         try:
             lock_path.unlink()
         except Exception:
             pass
 
+def ensure_env_parent():
+    ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
+
 
 def load_env_file() -> dict:
     env = {}
-    # Acquire lock for safe concurrent reads
     ensure_env_parent()
     try:
         with file_lock(ENV_FILE):
@@ -130,7 +153,6 @@ def load_env_file() -> dict:
                         env[k.strip()] = v.strip()
                         os.environ.setdefault(k.strip(), v.strip())
     except TimeoutError:
-        # If lock timeout, fallback to best-effort read without lock
         if ENV_FILE.exists():
             for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
                 if "=" in line and not line.strip().startswith("#"):
@@ -140,15 +162,7 @@ def load_env_file() -> dict:
     return env
 
 
-def ensure_env_parent():
-    # Ensure .env parent exists
-    ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
-
-
 def write_env(env_map: dict):
-    """
-    Writes .env atomically (temp file in same dir + os.replace) under file lock.
-    """
     ensure_env_parent()
     lines = [
         "# Bitbucket Sync .env",
@@ -159,41 +173,28 @@ def write_env(env_map: dict):
         lines.append(f"{k}={v}")
     content = "\n".join(lines) + "\n"
 
-    # Acquire lock and write atomically
     try:
         with file_lock(ENV_FILE):
-            # Write to temp file in same directory to ensure atomic replace
             dirpath = str(ENV_FILE.parent)
-            with tempfile.NamedTemporaryFile(
-                "w", encoding="utf-8", dir=dirpath, delete=False
-            ) as tf:
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=dirpath, delete=False) as tf:
                 tf.write(content)
                 temp_name = tf.name
             os.replace(temp_name, str(ENV_FILE))
     except TimeoutError:
-        # If cannot acquire lock, fallback to best-effort write (not ideal but avoids crashing)
-        with tempfile.NamedTemporaryFile(
-            "w", encoding="utf-8", dir=str(ENV_FILE.parent), delete=False
-        ) as tf:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=str(ENV_FILE.parent), delete=False) as tf:
             tf.write(content)
             temp_name = tf.name
         os.replace(temp_name, str(ENV_FILE))
 
 
 def normalize_url_for_list(url: str) -> str:
-    """Normalize URL for comparison/storage in REPO_LIST: remove spaces and trailing slash."""
     return url.strip().rstrip("/")
 
 
 def parse_repo_list(text: str) -> List[str]:
-    """Parse REPO_LIST which may be one URL per line or comma-separated values.
-
-    Returns a list of non-empty normalized URL strings.
-    """
     if not text:
         return []
     items: List[str] = []
-    # support both line-separated and comma-separated values
     for line in text.splitlines():
         for part in line.split(","):
             p = part.strip()
@@ -202,55 +203,8 @@ def parse_repo_list(text: str) -> List[str]:
     return items
 
 
-def ensure_env_defaults() -> Tuple[dict, List[str]]:
-    """Load `.env`, ensure required keys and sensible defaults.
-
-    Returns (env_map, missing_required_keys).
-    - Ensures `INSECURE` and `REPO_LIST` exist (defaulting to 'true' and empty).
-    - Does basic validation: requires BITBUCKET_USER and BB_BASE_DIR and either
-      BITBUCKET_WORKSPACE or both BITBUCKET_BASE_URL and BITBUCKET_PROJECT.
-    - Writes `.env` back with defaults applied.
-    """
-    env_map = load_env_file()
-    # Ensure basic keys exist
-    changed = False
-    if "INSECURE" not in env_map:
-        env_map["INSECURE"] = "true"
-        changed = True
-    if "REPO_LIST" not in env_map:
-        env_map["REPO_LIST"] = ""
-        changed = True
-
-    # Minimal required fields
-    missing: List[str] = []
-    if not env_map.get("BITBUCKET_USER"):
-        missing.append("BITBUCKET_USER")
-    if not env_map.get("BB_BASE_DIR"):
-        missing.append("BB_BASE_DIR")
-
-    # require either workspace (cloud) or base_url+project (server)
-    if not env_map.get("BITBUCKET_WORKSPACE"):
-        if not (env_map.get("BITBUCKET_BASE_URL") and env_map.get("BITBUCKET_PROJECT")):
-            missing.append("BITBUCKET_WORKSPACE or (BITBUCKET_BASE_URL and BITBUCKET_PROJECT)")
-
-    # Persist defaults if necessary
-    if changed:
-        try:
-            write_env(env_map)
-        except Exception:
-            # best-effort: do not fail if write cannot happen
-            pass
-
-    return env_map, missing
-
-
 def ensure_url_in_repo_list(env_map: dict, url: str) -> bool:
-    """Ensure the URL is present in env_map['REPO_LIST'] (one per line).
-
-    Returns True if added, False if already present.
-    """
     raw = env_map.get("REPO_LIST", "") or ""
-    # Store REPO_LIST as one URL per line
     items = [x.strip() for x in raw.splitlines() if x.strip()]
     normalized_existing = {normalize_url_for_list(u) for u in items}
     norm_url = normalize_url_for_list(url)
@@ -262,90 +216,141 @@ def ensure_url_in_repo_list(env_map: dict, url: str) -> bool:
 
 
 def migrate_old_repo_keys(env_map: dict) -> None:
-    """Finds old keys REPO_<SLUG>=<URL> (without suffixes) and removes them from the map.
-
-    Does not migrate the URL values to `REPO_LIST`. Idempotent.
-    """
     keys = list(env_map.keys())
-    base_repo_keys = []
     for k in keys:
-        # Only match REPO_<SLUG> keys without suffixes (metadata keys have suffixes like _LAST_SYNC)
         if re.fullmatch(r"REPO_[A-Z0-9_]+", k):
-            base_repo_keys.append(k)
-    for k in base_repo_keys:
-        # Remove old per-repo URL keys, do not migrate to REPO_LIST
-        try:
             env_map.pop(k, None)
-        except Exception:
-            pass
-    # No hacemos write aquí: quien llamó a migrate_old_repo_keys se encargará de escribir
-    # No write here: caller of migrate_old_repo_keys is responsible for writing
+
+# =========================================================
+# Bitbucket helpers (Cloud / Server)
+# =========================================================
+
+@dataclass
+class Repo:
+    url: str
+    host: str
+    kind: str  # "cloud" | "server"
+    workspace: Optional[str] = None
+    project: Optional[str] = None
+    slug: Optional[str] = None
 
 
-# ---------- Bitbucket helpers ----------
-def detect_mode(workspace_or_url: str, base_url: str, project: str) -> Tuple[str, dict]:
-    """('cloud', {'workspace':...}) or ('server', {'base_url':..., 'project':...})"""
-    if workspace_or_url and workspace_or_url.startswith(("http://", "https://")):
-        u = urlparse(workspace_or_url)
-        m = re.search(r"/projects/([^/]+)/?", u.path, re.IGNORECASE)
-        if not m:
-            raise SystemExit("[ERR] BITBUCKET_WORKSPACE looks like URL but is not /projects/KEY")
-        return "server", {"base_url": f"{u.scheme}://{u.netloc}", "project": m.group(1)}
-    if base_url and project:
-        return "server", {"base_url": base_url, "project": project}
-    if workspace_or_url:
-        return "cloud", {"workspace": workspace_or_url}
-    raise SystemExit("[ERR] Incomplete destination config (Cloud or Server/DC).")
+def parse_repo_url(url: str) -> Repo:
+    u = urlparse(url)
+    host = u.netloc.lower()
+    parts = [p for p in u.path.split("/") if p]
+    if host.endswith("bitbucket.org") and len(parts) >= 2:
+        # Cloud: https://bitbucket.org/<workspace>/<repo>
+        return Repo(url=url, host=host, kind="cloud", workspace=parts[0], slug=parts[1].replace(".git", ""))
+    # Server/DC: https://host/scm/PROJ/repo(.git)  o  https://host/projects/PROJ/repos/repo
+    proj = None
+    slug = None
+    if len(parts) >= 3 and parts[0].lower() == "scm":
+        proj = parts[1]
+        slug = parts[2].replace(".git", "")
+    elif len(parts) >= 4 and parts[0].lower() == "projects" and parts[2].lower() == "repos":
+        proj = parts[1]
+        slug = parts[3].replace(".git", "")
+    return Repo(url=url, host=host, kind="server", project=proj, slug=slug)
 
 
 def http_get(url: str, auth, params=None) -> requests.Response:
     return requests.get(url, auth=auth, params=params, timeout=60, verify=VERIFY)
 
 
-def paginate_cloud(url: str, auth, params=None) -> Iterator[dict]:
-    # ... original implementation remains unchanged ...
-    next_url = url
-    qparams = params.copy() if params else {}
+def list_repo_clone_urls_server(base_url: str, project: str, auth) -> List[str]:
+    """Devuelve HTTPS clone URLs de todos los repos del proyecto (Server/DC)."""
+    urls, start = [], 0
     while True:
-        r = http_get(next_url, auth, params=qparams)
-        if r.status_code == 401:
-            raise RuntimeError(
-                "401 Cloud: use App Password or valid credentials for API (read-only)."
-            )
+        r = http_get(
+            f"{base_url}/rest/api/1.0/projects/{project}/repos",
+            auth,
+            params={"limit": 100, "start": start},
+        )
+        if r.status_code in (401, 403):
+            raise SystemExit("[AUTH] Credenciales inválidas para Server/DC")
         if r.status_code != 200:
-            raise RuntimeError(f"Bitbucket Cloud API {r.status_code}: {r.text}")
+            raise SystemExit(f"[ERR] Server API {r.status_code}: {r.text[:200]}")
         data = r.json()
-        for item in data.get("values", []):
-            yield item
-        if not data.get("next"):
+        for repo in data.get("values", []):
+            clones = repo.get("links", {}).get("clone", [])
+            href = next((c.get("href") for c in clones if c.get("name", "").lower() in ("http", "https")), None)
+            if href:
+                urls.append(href.rstrip("/"))
+        if data.get("isLastPage", True):
             break
-        next_url = data.get("next")
-        # ensure params not duplicated
-        qparams = {}
+        start = data.get("nextPageStart", 0)
+    return urls
 
 
-# ---------- git helpers ----------
-def run_git(
-    cmd: List[str],
-    cwd: Optional[Path] = None,
-    git_ca_bundle: Optional[str] = None,
-    insecure: bool = False,
-) -> int:
+def list_repo_clone_urls_cloud(workspace: str, auth) -> List[str]:
+    """Devuelve HTTPS clone URLs de todos los repos del workspace (Cloud)."""
+    urls = []
+    url = f"{API_CLOUD}/repositories/{workspace}"
+    params = {"pagelen": 100}
+    while True:
+        r = http_get(url, auth, params=params)
+        if r.status_code in (401, 403):
+            raise SystemExit("[AUTH] Credenciales inválidas para Cloud")
+        if r.status_code != 200:
+            raise SystemExit(f"[ERR] Cloud API {r.status_code}: {r.text[:200]}")
+        data = r.json()
+        for repo in data.get("values", []):
+            clones = repo.get("links", {}).get("clone", [])
+            href = next((c.get("href") for c in clones if c.get("name", "").lower() == "https"), None)
+            if href:
+                urls.append(href.rstrip("/"))
+        url = data.get("next")
+        if not url:
+            break
+        params = {}
+    return urls
+
+
+def validate_first_repo(repo: Repo, auth) -> None:
+    """Valida credenciales contra un repo concreto antes de clonar."""
+    if repo.kind == "cloud" and repo.workspace and repo.slug:
+        api = f"{API_CLOUD}/repositories/{repo.workspace}/{repo.slug}"
+        with spinning(f"Validando acceso a {repo.workspace}/{repo.slug}"):
+            r = http_get(api, auth)
+        if r.status_code == 200:
+            return
+        if r.status_code in (401, 403):
+            raise SystemExit("[AUTH] Credenciales inválidas para Bitbucket Cloud (401/403)")
+        raise SystemExit(f"[ERR] Cloud API {r.status_code}: {r.text[:200]}")
+    # Server/DC
+    u = urlparse(repo.url)
+    base = f"{u.scheme}://{u.netloc}"
+    if repo.project and repo.slug:
+        api = f"{base}/rest/api/1.0/projects/{repo.project}/repos/{repo.slug}"
+    else:
+        api = f"{base}/rest/api/1.0/projects"
+    with spinning(f"Validando acceso a {u.netloc}"):
+        r = http_get(api, auth)
+    if r.status_code == 200:
+        return
+    if r.status_code in (401, 403):
+        raise SystemExit("[AUTH] Credenciales inválidas para Bitbucket Server/DC (401/403)")
+    raise SystemExit(f"[ERR] Server API {r.status_code}: {r.text[:200]}")
+
+# =========================================================
+# git helpers
+# =========================================================
+
+def run_git(cmd: List[str], cwd: Optional[Path] = None, git_ca_bundle: Optional[str] = None, insecure: bool = False) -> int:
     env = os.environ.copy()
     if git_ca_bundle:
         env["GIT_SSL_CAINFO"] = git_ca_bundle
         env["CURL_CA_BUNDLE"] = git_ca_bundle
     if insecure:
         env["GIT_SSL_NO_VERIFY"] = "1"
-    env.pop("GIT_TERMINAL_PROMPT", None)  # allow GCM
+    env.pop("GIT_TERMINAL_PROMPT", None)  # permitir prompts de credenciales
     return subprocess.call(["git"] + cmd, cwd=str(cwd) if cwd else None, env=env)
 
 
 def run_git_capture(cmd: List[str], cwd: Optional[Path] = None) -> str:
     try:
-        out = subprocess.check_output(
-            ["git"] + cmd, cwd=str(cwd) if cwd else None, stderr=subprocess.DEVNULL
-        )
+        out = subprocess.check_output(["git"] + cmd, cwd=str(cwd) if cwd else None, stderr=subprocess.DEVNULL)
         return out.decode("utf-8", errors="ignore").strip()
     except Exception:
         return ""
@@ -362,86 +367,221 @@ def local_short_commit(repo_dir: Path) -> str:
     return run_git_capture(["rev-parse", "--short", "HEAD"], cwd=repo_dir)
 
 
-def now_iso_utc() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+def default_branch(repo_dir: Path) -> str:
+    ref = run_git_capture(["symbolic-ref", "refs/remotes/origin/HEAD"], cwd=repo_dir)
+    if ref and "/" in ref:
+        return ref.split("/")[-1]
+    b = run_git_capture(["rev-parse", "--abbrev-ref", "origin/HEAD"], cwd=repo_dir)
+    if b and "/" in b:
+        return b.split("/")[-1]
+    return ""
 
+# =========================================================
+# per-repo metadata in .env
+# =========================================================
 
-def update_env_repo(slug: str, url: str, default_branch: str, status: str, repo_dir: Path):
-    """
-    Incrementally updates .env for a repo:
-    - Removes old keys REPO_<SLUG>=<URL>.
-    - Adds the repo URL to REPO_LIST if not present (one per line).
-    - Updates metadata keys per slug (DEFAULT_BRANCH, LAST_SYNC, etc).
-    All changes are atomic and thread-safe.
-    """
+def update_env_repo(slug: str, url: str, def_branch: str, status: str, repo_dir: Path):
     existing = load_env_file()
-
-    # Remove old per-repo URL keys
     try:
         migrate_old_repo_keys(existing)
     except Exception:
         pass
-
-    # Add the repo URL to REPO_LIST if not present (one per line)
     try:
         ensure_url_in_repo_list(existing, url)
     except Exception:
         pass
-
-    # Update metadata per repo
-    key_base = slug.replace("-", "_").upper()
-    if default_branch:
-        existing[f"REPO_{key_base}_DEFAULT_BRANCH"] = default_branch
+    key_base = (slug or "repo").replace("-", "_").upper()
+    if def_branch:
+        existing[f"REPO_{key_base}_DEFAULT_BRANCH"] = def_branch
     existing[f"REPO_{key_base}_LAST_SYNC"] = now_iso_utc()
     existing[f"REPO_{key_base}_LAST_STATUS"] = status
     existing[f"REPO_{key_base}_LAST_COMMIT"] = local_short_commit(repo_dir) or ""
     existing[f"REPO_{key_base}_ACTIVE_BRANCH"] = local_active_branch(repo_dir) or ""
-
-    # Atomically write .env
     write_env(existing)
 
-    # Optionally commit .env into git if AUTO_COMMIT_ENV is enabled in env map
-    try:
-        auto = str(
-            existing.get("AUTO_COMMIT_ENV", os.environ.get("AUTO_COMMIT_ENV", "false"))
-        ).lower()
-        if auto in ("1", "true", "yes", "y"):
-            msg = f"env: update {key_base} {now_iso_utc()}"
-            try:
-                # Stage and commit .env in the repository root (ENV_FILE.parent)
-                ret = run_git(["add", str(ENV_FILE.name)], cwd=ENV_FILE.parent)
-                if ret == 0:
-                    cret = run_git(["commit", "-m", msg], cwd=ENV_FILE.parent)
-                    if cret != 0:
-                        print(f"Warning: git commit for .env returned {cret}")
-                else:
-                    print(f"Warning: git add .env returned {ret}")
-            except Exception as e:
-                print(f"Warning: failed to auto-commit .env: {e}")
-    except Exception:
-        # Non-fatal: do not break sync because commit failed
-        pass
+# =========================================================
+# core env + discovery
+# =========================================================
+
+def ensure_env_defaults() -> Tuple[dict, List[str]]:
+    env_map = load_env_file()
+    changed = False
+    if "INSECURE" not in env_map:
+        env_map["INSECURE"] = "true"
+        changed = True
+    if "REPO_LIST" not in env_map:
+        env_map["REPO_LIST"] = ""
+        changed = True
+    if changed:
+        write_env(env_map)
+
+    missing: List[str] = []
+    if not env_map.get("BITBUCKET_USER"):
+        missing.append("BITBUCKET_USER")
+    if not (env_map.get("BB_PASSWORD") or env_map.get("BITBUCKET_APP_PASSWORD")):
+        missing.append("BB_PASSWORD (o BITBUCKET_APP_PASSWORD)")
+    if not env_map.get("BB_BASE_DIR"):
+        missing.append("BB_BASE_DIR")
+    if not env_map.get("BITBUCKET_WORKSPACE") and not (env_map.get("BITBUCKET_BASE_URL") and env_map.get("BITBUCKET_PROJECT")):
+        missing.append("BITBUCKET_WORKSPACE o (BITBUCKET_BASE_URL y BITBUCKET_PROJECT)")
+
+    return env_map, missing
 
 
-def str2bool(s: str) -> bool:
-    return str(s).lower() in ("1", "true", "yes", "y")
+def prompt_missing(env_map: dict, missing_keys: List[str]) -> dict:
+    print("Config .env incompleta. Te pido los datos mínimos:")
+    mk = ", ".join(missing_keys)
+    if "BITBUCKET_USER" in mk:
+        env_map["BITBUCKET_USER"] = input("BITBUCKET_USER: ").strip()
+    if "BB_PASSWORD" in mk or "BITBUCKET_APP_PASSWORD" in mk:
+        pw = getpass.getpass("App Password / BB_PASSWORD: ")
+        if pw:
+            env_map["BB_PASSWORD"] = pw
+    if "BB_BASE_DIR" in mk:
+        base = input("BB_BASE_DIR (ruta donde clonar): ").strip()
+        env_map["BB_BASE_DIR"] = base or str((Path.home() / "bitbucket").resolve())
+    if "BITBUCKET_WORKSPACE o (BITBUCKET_BASE_URL y BITBUCKET_PROJECT)" in mk:
+        ws = input("BITBUCKET_WORKSPACE (Cloud) [deja vacío si usas Server]: ").strip()
+        if ws:
+            env_map["BITBUCKET_WORKSPACE"] = ws
+        else:
+            base = input("BITBUCKET_BASE_URL (Server, ej https://bitbucket.miempresa.com): ").strip()
+            proj = input("BITBUCKET_PROJECT (clave del proyecto, ej MIPROY): ").strip()
+            env_map["BITBUCKET_BASE_URL"] = base
+            env_map["BITBUCKET_PROJECT"] = proj
+    write_env(env_map)
+    return env_map
 
 
-# ---------- main ----------
-def main():
-    _, missing = ensure_env_defaults()
+def ensure_repo_list(env_map: dict) -> List[str]:
+    """Lee REPO_LIST; si está vacío, descubre por API y guarda en .env."""
+    urls = parse_repo_list(env_map.get("REPO_LIST", ""))
+    if urls:
+        return [normalize_url_for_list(u) for u in urls]
+
+    auth = (env_map.get("BITBUCKET_USER"), env_map.get("BB_PASSWORD") or env_map.get("BITBUCKET_APP_PASSWORD"))
+    workspace = (env_map.get("BITBUCKET_WORKSPACE") or "").strip()
+    base_url = (env_map.get("BITBUCKET_BASE_URL") or "").strip()
+    project = (env_map.get("BITBUCKET_PROJECT") or "").strip()
+
+    if base_url and project:
+        print(f"[INFO] Descubriendo repos en {base_url} proyecto {project} …")
+        discovered = list_repo_clone_urls_server(base_url, project, auth)
+    elif workspace:
+        print(f"[INFO] Descubriendo repos en workspace Cloud {workspace} …")
+        discovered = list_repo_clone_urls_cloud(workspace, auth)
+    else:
+        raise SystemExit("[ERR] Falta destino: define BITBUCKET_WORKSPACE (Cloud) o BITBUCKET_BASE_URL+BITBUCKET_PROJECT (Server).")
+
+    if not discovered:
+        raise SystemExit("[ERR] No se encontraron repos en el workspace/proyecto.")
+
+    existing = load_env_file()
+    for u in discovered:
+        ensure_url_in_repo_list(existing, u)
+    write_env(existing)
+
+    return [normalize_url_for_list(u) for u in discovered]
+
+# =========================================================
+# core clone/update
+# =========================================================
+
+def ensure_basedir(path_str: str) -> Path:
+    # evita errores si por accidente ponen rutas Windows dentro de WSL
+    p = Path(path_str.replace("\\", "/")).expanduser().resolve()
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def first_auth(env_map: dict):
+    user = env_map.get("BITBUCKET_USER")
+    pw = env_map.get("BB_PASSWORD") or env_map.get("BITBUCKET_APP_PASSWORD")
+    return (user, pw)
+
+
+def clone_or_update(repo: Repo, base_dir: Path, insecure: bool, ca_bundle: Optional[str]) -> Tuple[str, Path]:
+    name = repo.slug or Path(urlparse(repo.url).path).name.replace(".git", "")
+    dest = base_dir / name
+    if dest.exists() and (dest / ".git").exists():
+        with spinning(f"Actualizando {name}"):
+            rc = run_git(["fetch", "--all"], cwd=dest, insecure=insecure, git_ca_bundle=ca_bundle)
+            if rc == 0:
+                _ = run_git(["pull", "--ff-only"], cwd=dest, insecure=insecure, git_ca_bundle=ca_bundle)
+                return ("updated", dest)
+            return ("error", dest)
+    else:
+        with spinning(f"Clonando {name}"):
+            rc = run_git(["clone", repo.url, str(dest)], insecure=insecure, git_ca_bundle=ca_bundle)
+        if rc == 0:
+            return ("cloned", dest)
+        return ("error", dest)
+
+# =========================================================
+# main
+# =========================================================
+
+def main() -> int:
+    print("BB_SYNC starting…")
+    log_debug(f"python={sys.version.split()[0]} cwd={os.getcwd()} env_file={ENV_FILE}")
+
+    env, missing = ensure_env_defaults()
     if missing:
-        print("Missing required .env values:", ", ".join(missing))
-        print("Please fill them in .env and re-run.")
-        sys.exit(1)
+        env = prompt_missing(env, missing)
 
-    # Environment looks OK for a run. The full sync flow runs here (not implemented
-    # in this small incremental update). This function currently verifies env and
-    # exits successfully.
-    print("Environment OK. Ready to run sync.")
+    # Config TLS/verify a partir de .env
+    global VERIFY
+    insecure = str2bool(env.get("INSECURE", "true"))
+    ca_bundle = env.get("CA_BUNDLE") or env.get("BITBUCKET_CA_BUNDLE") or env.get("GIT_CA_BUNDLE") or None
+    VERIFY = False if insecure else (ca_bundle if ca_bundle else True)
+
+    # Descubre/lee la lista
+    urls = ensure_repo_list(env)
+    if not urls:
+        print("[ERR] REPO_LIST vacío y no se pudo descubrir nada.")
+        return 2
+
+    base_dir = ensure_basedir(env.get("BB_BASE_DIR", "./repos"))
+    auth = first_auth(env)
+
+    # Valida contra el primer repo
+    first_repo = parse_repo_url(urls[0])
+    validate_first_repo(first_repo, auth)
+
+    # Procesa todos
+    for url in urls:
+        repo = parse_repo_url(url)
+        # Garantiza que esté en REPO_LIST por si lanzas el script con URL externa
+        env2 = load_env_file()
+        if ensure_url_in_repo_list(env2, url):
+            write_env(env2)
+
+        status, repo_dir = clone_or_update(repo, base_dir, insecure, ca_bundle)
+        try:
+            dbranch = default_branch(repo_dir)
+        except Exception:
+            dbranch = ""
+        try:
+            update_env_repo(repo.slug or "repo", url, dbranch, status, repo_dir)
+        except Exception as e:
+            print(f"[WARN] No se pudo actualizar metadatos .env para {url}: {e}")
+
+    print("\nTodo listo. Repos sincronizados/actualizados.")
     return 0
 
 
-# If run as script
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        rc = main()
+        sys.exit(rc)
+    except KeyboardInterrupt:
+        print("\nInterrumpido por el usuario.")
+        sys.exit(130)
+    except SystemExit:
+        raise
+    except Exception as e:
+        print(f"[ERR] {e}")
+        if DEBUG:
+            import traceback
+            traceback.print_exc()
+        sys.exit(1)
