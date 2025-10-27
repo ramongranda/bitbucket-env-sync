@@ -343,7 +343,13 @@ def validate_first_repo(repo: Repo, auth, cred_host: str) -> None:
 # git helpers
 # =========================================================
 
-def run_git(cmd: List[str], cwd: Optional[Path] = None, git_ca_bundle: Optional[str] = None, insecure: bool = False) -> int:
+def run_git(
+    cmd: List[str],
+    cwd: Optional[Path] = None,
+    git_ca_bundle: Optional[str] = None,
+    insecure: bool = False,
+    stream_output: bool = False,
+) -> int:
     env = os.environ.copy()
     if git_ca_bundle:
         env["GIT_SSL_CAINFO"] = git_ca_bundle
@@ -351,7 +357,27 @@ def run_git(cmd: List[str], cwd: Optional[Path] = None, git_ca_bundle: Optional[
     if insecure:
         env["GIT_SSL_NO_VERIFY"] = "1"
     env.pop("GIT_TERMINAL_PROMPT", None)  # permitir prompts de credenciales
-    return subprocess.call(["git"] + cmd, cwd=str(cwd) if cwd else None, env=env)
+    env["GIT_PROGRESS"] = "1"
+    if not stream_output:
+        return subprocess.call(["git"] + cmd, cwd=str(cwd) if cwd else None, env=env)
+
+    process = subprocess.Popen(
+        ["git"] + cmd,
+        cwd=str(cwd) if cwd else None,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    assert process.stdout is not None
+    try:
+        for line in process.stdout:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+    finally:
+        process.stdout.close()
+    return process.wait()
 
 
 def run_git_capture(cmd: List[str], cwd: Optional[Path] = None) -> str:
@@ -422,34 +448,28 @@ def ensure_git_credentials_store(host: str, user: str, password: str) -> None:
     subprocess.run(["git", "config", "--global", "credential.helper", "store"], check=False)
 
 
-def load_or_prompt_credentials(host: str) -> tuple[str, str]:
-    """Obtiene credenciales desde git-store; permite sobrescribirlas si el usuario lo desea."""
+def ensure_store_has_credentials(host: str, user: str, password: str) -> None:
+    """Verifica si las credenciales actuales están en git-store; si no, las guarda."""
     cred_file = Path.home() / ".git-credentials"
-    stored: Optional[tuple[str, str]] = None
     if cred_file.exists():
         try:
             for line in cred_file.read_text(encoding="utf-8", errors="ignore").splitlines():
-                if host in line and "@" in line:
-                    m = re.match(r"https://([^:]+):([^@]+)@", line)
-                    if m:
-                        stored = (m.group(1), m.group(2))
-                        break
+                if _match_credential_host(line, host) and f"{user}:{password}@" in line:
+                    return
         except Exception:
-            stored = None
-
-    if stored:
-        reuse = input(
-            f"Se encontraron credenciales guardadas para {host}. ¿Usarlas? [Enter = sí / n = no]: "
-        ).strip().lower()
-        if reuse in ("", "s", "si", "sí", "y", "yes"):
-            return stored
-        print("Introduce nuevas credenciales.")
-
-    user = input("Usuario Bitbucket: ").strip()
-    password = getpass.getpass("App Password: ").strip()
-    if not user or not password:
-        raise SystemExit("Usuario y App Password son obligatorios.")
+            pass
     ensure_git_credentials_store(host, user, password)
+
+
+def get_env_credentials(env_map: dict) -> tuple[str, str]:
+    user = (env_map.get("BITBUCKET_USERNAME") or "").strip()
+    password = (env_map.get("BITBUCKET_PASSWORD") or "").strip()
+    if not user or not password:
+        raise SystemExit(
+            "Faltan credenciales en .env (BITBUCKET_USERNAME/BITBUCKET_PASSWORD). Actualiza el archivo y reintenta."
+        )
+    host = resolve_bitbucket_host(env_map)
+    ensure_store_has_credentials(host, user, password)
     return user, password
 
 
@@ -467,6 +487,7 @@ def remove_git_credentials(host: str) -> None:
         return
     with cred_file.open("w", encoding="utf-8") as f:
         f.write(("\n".join(filtered) + "\n") if filtered else "")
+    print(f"[INFO] Se borraron credenciales almacenadas para {host}. Actualiza BITBUCKET_USERNAME/BITBUCKET_PASSWORD si es necesario.")
 
 
 def resolve_bitbucket_host(env_map: dict) -> str:
@@ -479,9 +500,7 @@ def resolve_bitbucket_host(env_map: dict) -> str:
 
 def first_auth(env_map: dict) -> tuple[str, str]:
     """Obtiene (usuario, password) desde git-store; si no existen, los solicita y guarda."""
-    host = resolve_bitbucket_host(env_map)
-    user, pw = load_or_prompt_credentials(host)
-    return user, pw
+    return get_env_credentials(env_map)
 
 # =========================================================
 # per-repo metadata in .env
@@ -519,6 +538,12 @@ def ensure_env_defaults() -> Tuple[dict, List[str]]:
     if "REPO_LIST" not in env_map:
         env_map["REPO_LIST"] = ""
         changed = True
+    if "BITBUCKET_USERNAME" not in env_map:
+        env_map["BITBUCKET_USERNAME"] = ""
+        changed = True
+    if "BITBUCKET_PASSWORD" not in env_map:
+        env_map["BITBUCKET_PASSWORD"] = ""
+        changed = True
     if changed:
         write_env(env_map)
 
@@ -527,6 +552,10 @@ def ensure_env_defaults() -> Tuple[dict, List[str]]:
         missing.append("BB_BASE_DIR")
     if not env_map.get("BITBUCKET_WORKSPACE") and not (env_map.get("BITBUCKET_BASE_URL") and env_map.get("BITBUCKET_PROJECT")):
         missing.append("BITBUCKET_WORKSPACE o (BITBUCKET_BASE_URL y BITBUCKET_PROJECT)")
+    if not env_map.get("BITBUCKET_USERNAME"):
+        missing.append("BITBUCKET_USERNAME")
+    if not env_map.get("BITBUCKET_PASSWORD"):
+        missing.append("BITBUCKET_PASSWORD")
 
     return env_map, missing
 
@@ -546,6 +575,10 @@ def prompt_missing(env_map: dict, missing_keys: List[str]) -> dict:
             proj = input("BITBUCKET_PROJECT (clave del proyecto, ej MIPROY): ").strip()
             env_map["BITBUCKET_BASE_URL"] = base
             env_map["BITBUCKET_PROJECT"] = proj
+    if "BITBUCKET_USERNAME" in missing_keys:
+        env_map["BITBUCKET_USERNAME"] = input("BITBUCKET_USERNAME: ").strip()
+    if "BITBUCKET_PASSWORD" in missing_keys:
+        env_map["BITBUCKET_PASSWORD"] = getpass.getpass("BITBUCKET_PASSWORD: ").strip()
     write_env(env_map)
     return env_map
 
@@ -596,17 +629,39 @@ def clone_or_update(repo: Repo, base_dir: Path, insecure: bool, ca_bundle: Optio
     name = repo.slug or Path(urlparse(repo.url).path).name.replace(".git", "")
     dest = base_dir / name
     if dest.exists() and (dest / ".git").exists():
-        with spinning(f"Actualizando {name}"):
-            rc = run_git(["fetch", "--all"], cwd=dest, insecure=insecure, git_ca_bundle=ca_bundle)
-            if rc == 0:
-                _ = run_git(["pull", "--ff-only"], cwd=dest, insecure=insecure, git_ca_bundle=ca_bundle)
-                return ("updated", dest)
-            return ("error", dest)
-    else:
-        with spinning(f"Clonando {name}"):
-            rc = run_git(["clone", repo.url, str(dest)], insecure=insecure, git_ca_bundle=ca_bundle)
+        print(f"\nActualizando {name} …")
+        rc = run_git(
+            ["fetch", "--all"],
+            cwd=dest,
+            insecure=insecure,
+            git_ca_bundle=ca_bundle,
+            stream_output=True,
+        )
         if rc == 0:
+            rc_pull = run_git(
+                ["pull", "--ff-only"],
+                cwd=dest,
+                insecure=insecure,
+                git_ca_bundle=ca_bundle,
+                stream_output=True,
+            )
+            if rc_pull == 0:
+                print(f"[OK] {name} actualizado.")
+                return ("updated", dest)
+        print(f"[ERR] No se pudo actualizar {name}.")
+        return ("error", dest)
+    else:
+        print(f"\nClonando {name} desde {repo.url} …")
+        rc = run_git(
+            ["clone", repo.url, str(dest)],
+            insecure=insecure,
+            git_ca_bundle=ca_bundle,
+            stream_output=True,
+        )
+        if rc == 0:
+            print(f"[OK] {name} clonado en {dest}.")
             return ("cloned", dest)
+        print(f"[ERR] No se pudo clonar {name}.")
         return ("error", dest)
 
 # =========================================================
