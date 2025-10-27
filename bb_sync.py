@@ -157,18 +157,51 @@ def load_env_file() -> dict:
     try:
         with file_lock(ENV_FILE):
             if ENV_FILE.exists():
-                for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
-                    if "=" in line and not line.strip().startswith("#"):
+                last_key: Optional[str] = None
+                for raw in ENV_FILE.read_text(encoding="utf-8").splitlines():
+                    line = raw.rstrip()
+                    if not line.strip():
+                        # empty line resets last_key
+                        last_key = None
+                        continue
+                    if line.strip().startswith("#"):
+                        # comment line
+                        last_key = None
+                        continue
+                    if "=" in line:
                         k, v = line.split("=", 1)
-                        env[k.strip()] = v.strip()
-                        os.environ.setdefault(k.strip(), v.strip())
+                        key = k.strip()
+                        val = v.rstrip()
+                        env[key] = val
+                        os.environ.setdefault(key, val)
+                        last_key = key
+                    else:
+                        # continuation line: append to last key's value (preserve newlines)
+                        if last_key:
+                            env[last_key] = env.get(last_key, "") + "\n" + line.strip()
+                            os.environ.setdefault(last_key, env[last_key])
     except TimeoutError:
         if ENV_FILE.exists():
-            for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
-                if "=" in line and not line.strip().startswith("#"):
+            last_key: Optional[str] = None
+            for raw in ENV_FILE.read_text(encoding="utf-8").splitlines():
+                line = raw.rstrip()
+                if not line.strip():
+                    last_key = None
+                    continue
+                if line.strip().startswith("#"):
+                    last_key = None
+                    continue
+                if "=" in line:
                     k, v = line.split("=", 1)
-                    env[k.strip()] = v.strip()
-                    os.environ.setdefault(k.strip(), v.strip())
+                    key = k.strip()
+                    val = v.rstrip()
+                    env[key] = val
+                    os.environ.setdefault(key, val)
+                    last_key = key
+                else:
+                    if last_key:
+                        env[last_key] = env.get(last_key, "") + "\n" + line.strip()
+                        os.environ.setdefault(last_key, env[last_key])
     return env
 
 
